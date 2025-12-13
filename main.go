@@ -82,8 +82,8 @@ func NewApp(dbPath string) (*App, error) {
 func (a *App) initDB() error {
 	_, err := a.DB.Exec(`CREATE TABLE IF NOT EXISTS pastes (
 		id TEXT PRIMARY KEY,
-		data TEXT NOT NULL,
-		iv TEXT NOT NULL,
+		data BLOB NOT NULL,
+		iv BLOB NOT NULL,
 		created DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	if err != nil {
@@ -219,12 +219,17 @@ func createHandler(app *App) http.HandlerFunc {
 			return
 		}
 
-		decoded, err := base64.RawURLEncoding.DecodeString(req.Data)
-		if err != nil || int64(len(decoded)) > app.MaxSize {
-			http.Error(w, "Invalid or oversized data", http.StatusRequestEntityTooLarge)
+		decodedData, err := base64.StdEncoding.DecodeString(req.Data)
+		if err != nil {
+			http.Error(w, "Invalid data encoding", http.StatusBadRequest)
 			return
 		}
-		decodedIV, err := base64.RawURLEncoding.DecodeString(req.IV)
+		if int64(len(decodedData)) > app.MaxSize {
+			http.Error(w, "Oversized data", http.StatusRequestEntityTooLarge)
+			return
+		}
+
+		decodedIV, err := base64.StdEncoding.DecodeString(req.IV)
 		if err != nil || len(decodedIV) != ivSize {
 			http.Error(w, "Invalid IV", http.StatusBadRequest)
 			return
@@ -237,7 +242,7 @@ func createHandler(app *App) http.HandlerFunc {
 		for {
 			id = randString(length)
 			res, err := app.DB.Exec("INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)",
-				id, req.Data, req.IV)
+				id, decodedData, decodedIV)
 			if err == nil {
 				rows, _ := res.RowsAffected()
 				if rows == 1 {
@@ -293,9 +298,10 @@ func getPaste(app *App, w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	var data, iv string
+	var dataBlob []byte
+	var ivBlob []byte
 	var created time.Time
-	err := app.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).Scan(&data, &iv, &created)
+	err := app.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).Scan(&dataBlob, &ivBlob, &created)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
@@ -310,10 +316,13 @@ func getPaste(app *App, w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
+	dataB64 := base64.StdEncoding.EncodeToString(dataBlob)
+	ivB64 := base64.StdEncoding.EncodeToString(ivBlob)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"data":    data,
-		"iv":      iv,
+		"data":    dataB64,
+		"iv":      ivB64,
 		"created": created,
 	})
 }

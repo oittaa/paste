@@ -64,17 +64,17 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("CreateHandler", func(t *testing.T) {
-		// Prepare fake encrypted data and IV (server stores base64, checks size after decode)
+		// Prepare fake encrypted data and IV (server stores binary, checks size after decode)
 		plaintext := "test paste content"
 		fakeEncData := []byte(plaintext + " [fake encrypted]")
 
-		b64Data := base64.RawURLEncoding.EncodeToString(fakeEncData)
+		b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
 
 		iv := make([]byte, 12)
 		if _, err := rand.Read(iv); err != nil {
 			t.Fatalf("Failed to generate IV: %v", err)
 		}
-		b64IV := base64.RawURLEncoding.EncodeToString(iv)
+		b64IV := base64.StdEncoding.EncodeToString(iv)
 
 		reqBody, err := json.Marshal(map[string]string{
 			"data": b64Data,
@@ -127,7 +127,7 @@ func TestAppIntegration(t *testing.T) {
 
 		// Test oversized data (hits post-decode check with +1 byte)
 		oversized := make([]byte, int(*maxSize)+1)
-		b64Oversized := base64.RawURLEncoding.EncodeToString(oversized)
+		b64Oversized := base64.StdEncoding.EncodeToString(oversized)
 		oversizedReqBody, _ := json.Marshal(map[string]string{
 			"data": b64Oversized,
 			"iv":   b64IV,
@@ -143,7 +143,7 @@ func TestAppIntegration(t *testing.T) {
 
 		// Test invalid IV length
 		invalidIV := make([]byte, 11)
-		b64InvalidIV := base64.RawURLEncoding.EncodeToString(invalidIV)
+		b64InvalidIV := base64.StdEncoding.EncodeToString(invalidIV)
 		invalidIVReqBody, _ := json.Marshal(map[string]string{
 			"data": b64Data,
 			"iv":   b64InvalidIV,
@@ -172,12 +172,12 @@ func TestAppIntegration(t *testing.T) {
 		// First, create a paste to retrieve
 		plaintext := "retrievable paste"
 		fakeEncData := []byte(plaintext + " [fake encrypted]")
-		b64Data := base64.RawURLEncoding.EncodeToString(fakeEncData)
+		b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
 		iv := make([]byte, 12)
 		if _, err := rand.Read(iv); err != nil {
 			t.Fatalf("Failed to generate IV: %v", err)
 		}
-		b64IV := base64.RawURLEncoding.EncodeToString(iv)
+		b64IV := base64.StdEncoding.EncodeToString(iv)
 
 		reqBody, _ := json.Marshal(map[string]string{"data": b64Data, "iv": b64IV})
 		createRes, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
@@ -330,7 +330,7 @@ func TestAppIntegration(t *testing.T) {
 		// Manually insert an expired paste using SQLite's datetime (mimics cleanup threshold)
 		expiredModifier := "-31 days" // > app default (30 days); use hours for sub-day tests
 		_, err := app.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', ?))`,
-			"expired", "fakeb64data", "fakeb64iv", expiredModifier)
+			"expired", []byte("fakeb64data"), []byte("fakeb64iv"), expiredModifier)
 		if err != nil {
 			t.Fatalf("Failed to insert expired paste: %v", err)
 		}
@@ -351,7 +351,7 @@ func TestAppIntegration(t *testing.T) {
 
 		// Insert a non-expired one using current time (fresh)
 		_, err = app.DB.Exec(`INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)`,
-			"fresh", "fakeb64data", "fakeb64iv")
+			"fresh", []byte("fakeb64data"), []byte("fakeb64iv"))
 		if err != nil {
 			t.Fatalf("Failed to insert fresh paste: %v", err)
 		}
@@ -392,12 +392,12 @@ func TestAppIntegration(t *testing.T) {
 
 		const numInserts = 200 // Hundreds to stress retries and bumping
 		var ids []string
-		dummyB64Data := base64.RawURLEncoding.EncodeToString([]byte("dummy data"))
+		dummyB64Data := base64.StdEncoding.EncodeToString([]byte("dummy data"))
 		dummyIV := make([]byte, 12)
 		if _, err := rand.Read(dummyIV); err != nil {
 			t.Fatalf("Failed to generate dummy IV: %v", err)
 		}
-		dummyB64IV := base64.RawURLEncoding.EncodeToString(dummyIV)
+		dummyB64IV := base64.StdEncoding.EncodeToString(dummyIV)
 		reqBody, _ := json.Marshal(map[string]string{"data": dummyB64Data, "iv": dummyB64IV})
 
 		for i := 0; i < numInserts; i++ {
