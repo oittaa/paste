@@ -1,104 +1,61 @@
+const ivLength = 12;
+const tagLength = 128;
 let currentKey = null;
-let currentIv = null;
+
+function base64Encode(buffer) {
+  return new Uint8Array(buffer).toBase64();
+}
 
 function base64urlEncode(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let str = btoa(String.fromCharCode(...bytes));
-  return str.replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  return base64Encode(buffer)
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function base64Decode(str) {
+  return Uint8Array.fromBase64(str);
 }
 
 function base64urlDecode(str) {
   str = str.replace(/-/g, '+').replace(/_/g, '/');
   while (str.length % 4) str += '=';
-  const binary = atob(str);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
+  return base64Decode(str);
 }
 
 async function compress(data) {
-  if (!('CompressionStream' in window)) {
-    throw new Error('Compression not supported in this browser');
-  }
-  const compressedStream = new CompressionStream('gzip');
-  const writer = compressedStream.writable.getWriter();
-  const reader = compressedStream.readable.getReader();
-  writer.write(data);
-  writer.close();
-  const chunks = [];
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
+  const stream = new Blob([data]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 async function decompress(compressed) {
-  if (!('DecompressionStream' in window)) {
-    throw new Error('Decompression not supported in this browser');
-  }
-  const decompressedStream = new DecompressionStream('gzip');
-  const writer = decompressedStream.writable.getWriter();
-  const reader = decompressedStream.readable.getReader();
-  writer.write(compressed);
-  writer.close();
-  const chunks = [];
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 async function encrypt(text, key) {
   const encoder = new TextEncoder();
   const data = encoder.encode(text);
   const compressed = await compress(data);
-  const iv = new Uint8Array(12);
-  crypto.getRandomValues(iv);
+  const iv = crypto.getRandomValues(new Uint8Array(ivLength));
+  
   const ctBuffer = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, tagLength: 128 },
+    { name: 'AES-GCM', iv, tagLength: tagLength },
     key,
     compressed
   );
-  const ct = new Uint8Array(ctBuffer);
+  
   return {
-    iv: base64urlEncode(iv.buffer),
-    ct: base64urlEncode(ct.buffer)
+    iv: base64Encode(iv.buffer),
+    ct: base64Encode(ctBuffer)
   };
 }
 
 async function decrypt(keyObj, ivStr, ctStr) {
-  const iv = base64urlDecode(ivStr);
-  const ct = base64urlDecode(ctStr);
+  const iv = base64Decode(ivStr);
+  const ct = base64Decode(ctStr);
   const decBuffer = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv, tagLength: 128 },
+    { name: 'AES-GCM', iv, tagLength: tagLength },
     keyObj,
     ct
   );
@@ -155,15 +112,17 @@ async function createPaste() {
     // Update URL without reloading
     history.pushState(null, '', newUrl);
     
-    try {
-      await navigator.clipboard.writeText(window.location.origin + newUrl);
-      showStatus('Paste created! URL copied to clipboard.', 'success');
-    } catch (e) {
-      showStatus('Paste created! Copy URL manually.', 'info');
-      console.warn('Clipboard failed:', e);
-    }
+    await navigator.clipboard.writeText(window.location.origin + newUrl);
+    showStatus('Paste created! URL copied to clipboard.', 'success');
   } catch (e) {
-    showStatus('Error: ' + e.message, 'error');
+    let msg = 'Error: ' + e.message;
+    if (e.name === 'TypeError' && e.message.includes('clipboard')) {
+      msg = 'Paste created! Copy URL manually.';
+      showStatus(msg, 'info');
+    } else {
+      showStatus(msg, 'error');
+    }
+    console.warn('Operation failed:', e);
   } finally {
     button.disabled = false;
     button.textContent = 'Create Paste';
@@ -192,11 +151,8 @@ async function copyToClipboard() {
     await navigator.clipboard.writeText(text);
     showStatus('Copied to clipboard!', 'success');
   } catch (err) {
-    // Fallback for older browsers or denied permissions
-    textarea.select();
-    textarea.setSelectionRange(0, 99999); // For mobile
-    document.execCommand('copy');
-    showStatus('Copied (fallback method)!', 'success');
+    showStatus('Copy failed! Try selecting and copying manually.', 'error');
+    console.warn('Clipboard failed:', err);
   }
 }
 
@@ -268,4 +224,14 @@ window.addEventListener('load', () => {
         copyBtn.addEventListener('click', copyToClipboard);
     }
     loadPaste();
+    const newBtn = document.getElementById('newBtn');
+    if (newBtn) {
+        newBtn.addEventListener('click', () => {
+            document.getElementById('output').value = '';
+            document.getElementById('output').focus();
+            document.getElementById('status').classList.remove('show');
+            currentKey = null;
+            history.pushState(null, '', '/');
+        });
+    }
 });
