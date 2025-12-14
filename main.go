@@ -47,7 +47,6 @@ type App struct {
 }
 
 func NewApp(dbPath string) (*App, error) {
-	// Parse template directly from the embedded FS
 	tmpl, err := template.ParseFS(content, "templates/index.html")
 	if err != nil {
 		return nil, err
@@ -106,7 +105,8 @@ func (a *App) runCleanup() {
 		log.Printf("Cleanup tx begin error: %v", err)
 		return
 	}
-	defer tx.Rollback() // Ensure rollback on error or panic
+	defer tx.Rollback()
+
 	hours := int(a.ExpDuration.Hours())
 	modifier := fmt.Sprintf("-%d hours", hours)
 	res, err := tx.Exec("DELETE FROM pastes WHERE created < datetime('now', ?)", modifier)
@@ -125,7 +125,6 @@ func (a *App) runCleanup() {
 }
 
 func (a *App) cleanupGoroutine() {
-	// Run cleanup immediately on startup
 	a.runCleanup()
 
 	ticker := time.NewTicker(a.CleanupInterval)
@@ -150,150 +149,132 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func main() {
-	flag.Parse()
+// Handlers as methods on *App
 
-	app, err := NewApp(*dbFile)
-	if err != nil {
-		log.Fatal(err)
+func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
 	}
-	defer app.Close()
-
-	app.StartCleanup()
-
-	mux := http.NewServeMux()
-
-	// Serve embedded static files (the JS)
-	mux.Handle("/static/", http.FileServer(http.FS(content)))
-
-	mux.HandleFunc("/", indexHandler(app))
-	mux.HandleFunc("/paste", createHandler(app))
-	mux.HandleFunc("/p/", pasteHandler(app))
-
-	addr := *listenAddr + ":" + *listenPort
-	log.Printf("Server listening on %s", addr)
-	// Wrap mux with security middleware
-	log.Fatal(http.ListenAndServe(addr, SecurityHeadersMiddleware(mux)))
-}
-
-func indexHandler(app *App) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := app.Tmpl.Execute(w, nil); err != nil {
-			log.Println(err)
-		}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := a.Tmpl.Execute(w, nil); err != nil {
+		log.Printf("Template execute error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 	}
 }
 
-func createHandler(app *App) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+func (a *App) serveHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-		// Security: Limit request body size to prevent DoS
-		r.Body = http.MaxBytesReader(w, r.Body, app.MaxSize*3/2+8192)
+	if err := a.DB.Ping(); err != nil {
+		log.Printf("Health check failed: DB ping error: %v", err)
+		http.Error(w, "unhealthy", http.StatusServiceUnavailable)
+		return
+	}
 
-		var req struct {
-			Data string `json:"data"`
-			IV   string `json:"iv"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			// Check if the error is due to size or simply bad JSON
-			if strings.Contains(err.Error(), "request body too large") {
-				http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
-			} else {
-				http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			}
-			return
-		}
-
-		// Basic validation before decoding
-		if int64(len(req.Data)) > app.MaxSize*2 {
-			http.Error(w, "Payload too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		decodedData, err := base64.StdEncoding.DecodeString(req.Data)
-		if err != nil {
-			http.Error(w, "Invalid data encoding", http.StatusBadRequest)
-			return
-		}
-		if int64(len(decodedData)) > app.MaxSize {
-			http.Error(w, "Oversized data", http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		decodedIV, err := base64.StdEncoding.DecodeString(req.IV)
-		if err != nil || len(decodedIV) != ivSize {
-			http.Error(w, "Invalid IV", http.StatusBadRequest)
-			return
-		}
-
-		var id string
-		length := app.IDLength
-		maxRetries := 100
-		retries := 0
-		for {
-			id = randString(length)
-			res, err := app.DB.Exec("INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)",
-				id, decodedData, decodedIV)
-			if err == nil {
-				rows, _ := res.RowsAffected()
-				if rows == 1 {
-					break
-				}
-			}
-			retries++
-			if retries >= maxRetries {
-				http.Error(w, "Server error", http.StatusInternalServerError)
-				return
-			}
-			if retries%10 == 0 {
-				length++
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"id": id})
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		w.Write([]byte("ok"))
 	}
 }
 
-func pasteHandler(app *App) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.URL.Path, "/")
-		if len(parts) < 3 || parts[1] != "p" {
-			http.NotFound(w, r)
-			return
-		}
-		id := parts[2]
-		if id == "" {
-			http.NotFound(w, r)
-			return
-		}
+func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-		if r.Method == http.MethodGet {
-			getPaste(app, w, r, id)
+	r.Body = http.MaxBytesReader(w, r.Body, a.MaxSize*3/2+8192)
+
+	var req struct {
+		Data string `json:"data"`
+		IV   string `json:"iv"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
 		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		}
+		return
+	}
+
+	if int64(len(req.Data)) > a.MaxSize*2 {
+		http.Error(w, "Payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	decodedData, err := base64.StdEncoding.DecodeString(req.Data)
+	if err != nil {
+		http.Error(w, "Invalid data encoding", http.StatusBadRequest)
+		return
+	}
+	if int64(len(decodedData)) > a.MaxSize {
+		http.Error(w, "Oversized data", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	decodedIV, err := base64.StdEncoding.DecodeString(req.IV)
+	if err != nil || len(decodedIV) != ivSize {
+		http.Error(w, "Invalid IV", http.StatusBadRequest)
+		return
+	}
+
+	var id string
+	length := a.IDLength
+	maxRetries := 100
+	retries := 0
+	for {
+		id = randString(length)
+		res, err := a.DB.Exec("INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)",
+			id, decodedData, decodedIV)
+		if err == nil {
+			rows, _ := res.RowsAffected()
+			if rows == 1 {
+				break
+			}
+		}
+		retries++
+		if retries >= maxRetries {
+			http.Error(w, "Server error", http.StatusInternalServerError)
+			return
+		}
+		if retries%10 == 0 {
+			length++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"id": id})
+}
+
+func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 || parts[1] != "p" || parts[2] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	id := parts[2]
+
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		a.getPaste(w, r, id)
+	} else {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func getPaste(app *App, w http.ResponseWriter, r *http.Request, id string) {
+func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	accept := r.Header.Get("Accept")
-
 	isHTML := strings.Contains(accept, "text/html")
 
 	if isHTML {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := app.Tmpl.Execute(w, nil); err != nil {
-			log.Println(err)
+		if err := a.Tmpl.Execute(w, nil); err != nil {
+			log.Printf("Template execute error: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 		}
 		return
 	}
@@ -301,7 +282,7 @@ func getPaste(app *App, w http.ResponseWriter, r *http.Request, id string) {
 	var dataBlob []byte
 	var ivBlob []byte
 	var created time.Time
-	err := app.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).Scan(&dataBlob, &ivBlob, &created)
+	err := a.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).Scan(&dataBlob, &ivBlob, &created)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
@@ -311,7 +292,7 @@ func getPaste(app *App, w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	if time.Since(created) > app.ExpDuration {
+	if time.Since(created) > a.ExpDuration {
 		http.Error(w, "Paste expired", http.StatusGone)
 		return
 	}
@@ -344,4 +325,29 @@ func randString(length int) string {
 		b[i] = charset[rb%charsetLen]
 	}
 	return string(b)
+}
+
+func main() {
+	flag.Parse()
+
+	app, err := NewApp(*dbFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer app.Close()
+
+	app.StartCleanup()
+
+	mux := http.NewServeMux()
+
+	mux.Handle("/static/", http.FileServer(http.FS(content)))
+
+	mux.HandleFunc("/", app.serveIndex)
+	mux.HandleFunc("/health", app.serveHealth)
+	mux.HandleFunc("/paste", app.serveCreate)
+	mux.HandleFunc("/p/", app.servePaste)
+
+	addr := *listenAddr + ":" + *listenPort
+	log.Printf("Server listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, SecurityHeadersMiddleware(mux)))
 }
