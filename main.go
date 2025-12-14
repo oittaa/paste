@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -24,7 +24,7 @@ const (
 	ivSize     = 12 // AES-GCM IV size in bytes
 )
 
-//go:embed templates/index.html static/script.js static/styles.css static/favicon.jpg
+//go:embed templates/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
 var content embed.FS
 
 var (
@@ -58,7 +58,7 @@ func NewApp(dbPath string) (*App, error) {
 	} else {
 		log.Println("Using file DB:", dbPath)
 	}
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
