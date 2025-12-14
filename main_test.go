@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestAppIntegration(t *testing.T) {

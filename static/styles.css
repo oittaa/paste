@@ -5,6 +5,7 @@
   --button-bg: #007bff;
   --button-fg: #ffffff;
   --button-hover: #0056b3;
+  --placeholder: #999999;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -14,8 +15,10 @@
     --button-bg: #0d7377;
     --button-fg: #ffffff;
     --button-hover: #0a5d5f;
+    --placeholder: #666666;
   }
 }
+
 body {
   margin: 0;
   padding: 0;
@@ -27,22 +30,53 @@ body {
   display: flex;
   flex-direction: column;
 }
-#output {
+
+#content {
   flex: 1;
-  width: 100%;
-  border: none;
-  outline: none;
-  background: var(--bg);
-  color: var(--fg);
+  position: relative;
+  overflow: hidden;
+}
+
+#content > * {
+  position: absolute;
+  inset: 0;
+  padding: 1rem;
+  box-sizing: border-box;
   font-family: 'SF Mono', Monaco, 'Cascadia Code', Consolas, monospace;
   font-size: 16px;
   line-height: 1.5;
-  padding: 1rem;
-  box-sizing: border-box;
-  resize: none;
+  background: var(--bg);
+  color: var(--fg);
   overflow-y: auto;
 }
-#output::placeholder { color: #999; }
+
+#output {
+  border: none;
+  outline: none;
+  resize: none;
+}
+
+#output::placeholder {
+  color: var(--placeholder);
+}
+
+#viewer {
+  display: none;
+}
+
+#viewer pre {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  height: 100%;
+}
+
+#viewer code {
+  display: block;
+  white-space: pre;
+}
+
 #button-container {
   padding: 0.5rem;
   border-top: 1px solid var(--border);
@@ -52,6 +86,7 @@ body {
   align-items: center;
   gap: 0.75rem;
 }
+
 button {
   background: var(--button-bg);
   color: var(--button-fg);
@@ -65,31 +100,36 @@ button {
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
   white-space: nowrap;
 }
-button:hover { 
-  background: var(--button-hover); 
+
+button:hover {
+  background: var(--button-hover);
   transform: translateY(-1px);
   box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
 }
-button:disabled { 
-  background: #6c757d; 
-  cursor: not-allowed; 
+
+button:disabled {
+  background: #6c757d;
+  cursor: not-allowed;
   box-shadow: none;
   transform: none;
 }
+
 #status {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
+  inset: 0 0 auto 0;
   padding: 1rem;
   background: rgba(0,0,0,0.8);
   color: white;
   text-align: center;
   transform: translateY(-100%);
-  transition: transform 0.3s;
+  transition: transform 0.3s ease;
   z-index: 1000;
 }
-#status.show { transform: translateY(0); }
+
+#status.show {
+  transform: translateY(0);
+}
+
 #status.error { background: #dc3545; }
 #status.success { background: #10b981; }
 #status.info { background: #17a2b8; }
