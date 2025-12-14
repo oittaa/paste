@@ -23,15 +23,51 @@ func TestAppIntegration(t *testing.T) {
 
 	// Do not start cleanup goroutine for tests
 
-	// Set up mux with handlers
+	// Set up mux with handlers (new method-based style)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", indexHandler(app))
-	mux.HandleFunc("/paste", createHandler(app))
-	mux.HandleFunc("/p/", pasteHandler(app))
+	mux.Handle("/static/", http.FileServer(http.FS(content)))
+	mux.HandleFunc("/", app.serveIndex)
+	mux.HandleFunc("/health", app.serveHealth)
+	mux.HandleFunc("/paste", app.serveCreate)
+	mux.HandleFunc("/p/", app.servePaste)
 
 	// Create test server
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
+
+	t.Run("HealthHandler", func(t *testing.T) {
+		// GET
+		res, err := srv.Client().Get(srv.URL + "/health")
+		if err != nil {
+			t.Fatalf("Failed to GET /health: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("Expected status 200 for /health, got %d", res.StatusCode)
+		}
+		body, _ := io.ReadAll(res.Body)
+		if string(body) != "ok" {
+			t.Errorf("Expected body 'ok', got %s", string(body))
+		}
+
+		// HEAD (no body)
+		req, err := http.NewRequest("HEAD", srv.URL+"/health", nil)
+		if err != nil {
+			t.Fatalf("Failed to create HEAD request: %v", err)
+		}
+		res, err = srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("Failed to HEAD /health: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("Expected status 200 for HEAD /health, got %d", res.StatusCode)
+		}
+		body, _ = io.ReadAll(res.Body)
+		if len(body) != 0 {
+			t.Errorf("Expected empty body on HEAD, got %s", string(body))
+		}
+	})
 
 	t.Run("IndexHandler", func(t *testing.T) {
 		res, err := srv.Client().Get(srv.URL + "/")
@@ -124,7 +160,7 @@ func TestAppIntegration(t *testing.T) {
 		}
 
 		// Test oversized data (hits post-decode check with +1 byte)
-		oversized := make([]byte, int(*maxSize)+1)
+		oversized := make([]byte, int(app.MaxSize)+1)
 		b64Oversized := base64.StdEncoding.EncodeToString(oversized)
 		oversizedReqBody, _ := json.Marshal(map[string]string{
 			"data": b64Oversized,
@@ -237,7 +273,6 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create default request: %v", err)
 		}
-		// No Accept header set (defaults to JSON)
 		res, err = srv.Client().Do(req)
 		if err != nil {
 			t.Fatalf("Failed to GET default /p/%s: %v", id, err)
@@ -309,7 +344,7 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected 404 for empty ID, got %d", res.StatusCode)
 		}
 
-		// Test non-GET method
+		// Test non-GET/HEAD method
 		req, err = http.NewRequest("POST", srv.URL+"/p/"+id, nil)
 		if err != nil {
 			t.Fatalf("Failed to create POST request: %v", err)
@@ -320,13 +355,13 @@ func TestAppIntegration(t *testing.T) {
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for non-GET, got %d", res.StatusCode)
+			t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
 		}
 	})
 
 	t.Run("Expiration", func(t *testing.T) {
-		// Manually insert an expired paste using SQLite's datetime (mimics cleanup threshold)
-		expiredModifier := "-31 days" // > app default (30 days); use hours for sub-day tests
+		// Manually insert an expired paste
+		expiredModifier := "-31 days"
 		_, err := app.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', ?))`,
 			"expired", []byte("fakeb64data"), []byte("fakeb64iv"), expiredModifier)
 		if err != nil {
@@ -347,7 +382,7 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected 410 for expired paste, got %d", res.StatusCode)
 		}
 
-		// Insert a non-expired one using current time (fresh)
+		// Insert a fresh paste
 		_, err = app.DB.Exec(`INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)`,
 			"fresh", []byte("fakeb64data"), []byte("fakeb64iv"))
 		if err != nil {
@@ -370,25 +405,25 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("IDCollisionHandling", func(t *testing.T) {
-		// Create a new app instance with small IDLength to force collisions and length bumping
+		// Create a new app instance with small IDLength to force collisions
 		testApp, err := NewApp(":memory:")
 		if err != nil {
 			t.Fatalf("Failed to create collision test app: %v", err)
 		}
 		defer testApp.Close()
 
-		// Set small initial length to exhaust namespace quickly (62^1 = 62 possible IDs)
-		testApp.IDLength = 1
+		testApp.IDLength = 1 // Force quick exhaustion
 
-		// Set up test mux and server for this subtest
+		// Set up test mux with new method handlers
 		testMux := http.NewServeMux()
-		testMux.HandleFunc("/", indexHandler(testApp))
-		testMux.HandleFunc("/paste", createHandler(testApp))
-		testMux.HandleFunc("/p/", pasteHandler(testApp))
+		testMux.Handle("/static/", http.FileServer(http.FS(content)))
+		testMux.HandleFunc("/", testApp.serveIndex)
+		testMux.HandleFunc("/paste", testApp.serveCreate)
+		testMux.HandleFunc("/p/", testApp.servePaste)
 		testSrv := httptest.NewServer(testMux)
 		defer testSrv.Close()
 
-		const numInserts = 200 // Hundreds to stress retries and bumping
+		const numInserts = 200
 		var ids []string
 		dummyB64Data := base64.StdEncoding.EncodeToString([]byte("dummy data"))
 		dummyIV := make([]byte, 12)
@@ -404,12 +439,11 @@ func TestAppIntegration(t *testing.T) {
 				t.Fatalf("Failed to POST insert %d: %v", i+1, err)
 			}
 
-			// Read body once
 			bodyBytes, err := io.ReadAll(res.Body)
 			if err != nil {
 				t.Fatalf("Failed to read insert %d body: %v", i+1, err)
 			}
-			res.Body.Close() // Manual close after ReadAll
+			res.Body.Close()
 
 			if res.StatusCode != http.StatusOK {
 				t.Fatalf("Expected 200 for insert %d, got %d: %s", i+1, res.StatusCode, string(bodyBytes))
@@ -425,12 +459,10 @@ func TestAppIntegration(t *testing.T) {
 			ids = append(ids, resp.ID)
 		}
 
-		// Verify all inserts succeeded and are unique
 		if len(ids) != numInserts {
 			t.Errorf("Expected %d inserts, got %d", numInserts, len(ids))
 		}
 
-		// Check uniqueness via DB query
 		var uniqueCount int
 		err = testApp.DB.QueryRow("SELECT COUNT(DISTINCT id) FROM pastes").Scan(&uniqueCount)
 		if err != nil {
@@ -440,7 +472,6 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected %d unique IDs in DB, got %d", numInserts, uniqueCount)
 		}
 
-		// Verify length bumping: After exhausting short IDs, some should be longer than initial (1)
 		var maxLen int
 		err = testApp.DB.QueryRow("SELECT MAX(LENGTH(id)) FROM pastes").Scan(&maxLen)
 		if err != nil {
@@ -450,7 +481,6 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected max ID length > %d after collisions, got %d", testApp.IDLength, maxLen)
 		}
 
-		// Optional: Log sample lengths for debugging
 		t.Logf("Sample ID lengths: %v (max: %d)", []int{len(ids[0]), len(ids[50]), len(ids[99]), len(ids[199])}, maxLen)
 	})
 }
