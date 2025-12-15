@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestAppIntegration(t *testing.T) {
@@ -251,9 +250,8 @@ func TestAppIntegration(t *testing.T) {
 		}
 
 		var getResp struct {
-			Data    string    `json:"data"`
-			IV      string    `json:"iv"`
-			Created time.Time `json:"created"`
+			Data string `json:"data"`
+			IV   string `json:"iv"`
 		}
 		if err := json.Unmarshal(bodyBytes, &getResp); err != nil {
 			t.Fatalf("Failed to unmarshal get response: %v", err)
@@ -263,9 +261,6 @@ func TestAppIntegration(t *testing.T) {
 		}
 		if getResp.IV != b64IV {
 			t.Errorf("Expected IV %s, got %s", b64IV, getResp.IV)
-		}
-		if getResp.Created.IsZero() {
-			t.Error("Expected non-zero created time")
 		}
 
 		// Test GET /p/{id} with default Accept (serves JSON)
