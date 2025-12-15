@@ -157,6 +157,10 @@ func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	a.renderViewer(w)
+}
+
+func (a *App) renderViewer(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := a.Tmpl.Execute(w, nil); err != nil {
 		slog.Error("Template execute error", "err", err)
@@ -275,11 +279,7 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Vary", "Accept")
 
 	if isHTML {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := a.Tmpl.Execute(w, nil); err != nil {
-			slog.Error("Template execute error", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-		}
+		a.renderViewer(w)
 		return
 	}
 
