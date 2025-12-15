@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -45,6 +46,7 @@ type App struct {
 	ExpDuration     time.Duration
 	CleanupInterval time.Duration
 	MaxSize         int64
+	writeMu         sync.Mutex
 }
 
 func NewApp(dbPath string) (*App, error) {
@@ -92,6 +94,18 @@ func (a *App) initDB() error {
 	_, err = a.DB.Exec("CREATE INDEX IF NOT EXISTS idx_created ON pastes(created)")
 	if err != nil {
 		slog.Warn("Failed to create index", "err", err)
+	}
+	_, err = a.DB.Exec("PRAGMA journal_mode=WAL")
+	if err != nil {
+		return err
+	}
+	_, err = a.DB.Exec("PRAGMA synchronous=NORMAL")
+	if err != nil {
+		return err
+	}
+	_, err = a.DB.Exec("PRAGMA busy_timeout=5000")
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -227,6 +241,9 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid IV", http.StatusBadRequest)
 		return
 	}
+
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
 
 	var id string
 	length := a.IDLength
