@@ -215,24 +215,6 @@ async function loadPaste() {
     const id = parts[2];
     const hash = window.location.hash.slice(1);
 
-    let decryptError = false;
-    let statusMsg = '';
-
-    if (hash) {
-        try {
-            const keyBytes = base64urlDecode(hash);
-            currentKey = await crypto.subtle.importKey(
-                'raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']
-            );
-        } catch (e) {
-            decryptError = true;
-            console.error('Key import failed:', e);
-            statusMsg = 'Invalid key in URL.';
-        }
-    } else {
-        statusMsg = 'Encrypted paste. Append #key to URL to view.';
-    }
-
     let respData;
     try {
         const res = await fetch('/p/' + id, {
@@ -253,22 +235,35 @@ async function loadPaste() {
         return false;
     }
 
-    if (currentKey && !decryptError) {
+    let decryptError = false;
+    let statusMsg = '';
+    let hasContent = false;
+
+    if (hash) {
         try {
+            const keyBytes = base64urlDecode(hash);
+            currentKey = await crypto.subtle.importKey(
+                'raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']
+            );
+
+            // Key imported successfully — attempt decryption
             const plain = await decrypt(currentKey, respData.iv, respData.data);
             document.getElementById('output').value = plain;
+            hasContent = true;
         } catch (e) {
             decryptError = true;
-            console.error('Decryption failed:', e);
-            statusMsg = 'Decryption failed: Invalid key.';
+            console.error('Key import or decryption failed:', e);
+            statusMsg = 'Invalid key in URL or decryption failed.';
         }
+    } else {
+        statusMsg = 'Encrypted paste. Append #key to URL to view.';
     }
 
     if (statusMsg) {
         showStatus(statusMsg, decryptError ? 'error' : 'info');
     }
 
-    return document.getElementById('output').value.trim() !== '';
+    return hasContent;
 }
 
 window.addEventListener('load', () => {

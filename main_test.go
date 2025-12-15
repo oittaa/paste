@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestAppIntegration(t *testing.T) {
@@ -251,9 +250,8 @@ func TestAppIntegration(t *testing.T) {
 		}
 
 		var getResp struct {
-			Data    string    `json:"data"`
-			IV      string    `json:"iv"`
-			Created time.Time `json:"created"`
+			Data string `json:"data"`
+			IV   string `json:"iv"`
 		}
 		if err := json.Unmarshal(bodyBytes, &getResp); err != nil {
 			t.Fatalf("Failed to unmarshal get response: %v", err)
@@ -263,9 +261,6 @@ func TestAppIntegration(t *testing.T) {
 		}
 		if getResp.IV != b64IV {
 			t.Errorf("Expected IV %s, got %s", b64IV, getResp.IV)
-		}
-		if getResp.Created.IsZero() {
-			t.Error("Expected non-zero created time")
 		}
 
 		// Test GET /p/{id} with default Accept (serves JSON)
@@ -344,7 +339,7 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected 404 for empty ID, got %d", res.StatusCode)
 		}
 
-		// Test non-GET/HEAD method
+		// Test non-GET method
 		req, err = http.NewRequest("POST", srv.URL+"/p/"+id, nil)
 		if err != nil {
 			t.Fatalf("Failed to create POST request: %v", err)
@@ -355,7 +350,7 @@ func TestAppIntegration(t *testing.T) {
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
+			t.Errorf("Expected 405 for non-GET, got %d", res.StatusCode)
 		}
 	})
 

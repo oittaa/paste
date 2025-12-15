@@ -9,8 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -53,9 +54,9 @@ func NewApp(dbPath string) (*App, error) {
 	}
 
 	if dbPath == ":memory:" {
-		log.Println("Using in-memory DB")
+		slog.Info("Using in-memory DB")
 	} else {
-		log.Println("Using file DB:", dbPath)
+		slog.Info("Using file DB", "path", dbPath)
 	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -90,7 +91,7 @@ func (a *App) initDB() error {
 	}
 	_, err = a.DB.Exec("CREATE INDEX IF NOT EXISTS idx_created ON pastes(created)")
 	if err != nil {
-		log.Printf("Warning: Failed to create index: %v", err)
+		slog.Warn("Failed to create index", "err", err)
 	}
 	return nil
 }
@@ -102,7 +103,7 @@ func (a *App) StartCleanup() {
 func (a *App) runCleanup() {
 	tx, err := a.DB.Begin()
 	if err != nil {
-		log.Printf("Cleanup tx begin error: %v", err)
+		slog.Error("Cleanup tx begin error", "err", err)
 		return
 	}
 	defer tx.Rollback()
@@ -111,16 +112,16 @@ func (a *App) runCleanup() {
 	modifier := fmt.Sprintf("-%d hours", hours)
 	res, err := tx.Exec("DELETE FROM pastes WHERE created < datetime('now', ?)", modifier)
 	if err != nil {
-		log.Printf("Cleanup delete error: %v", err)
+		slog.Error("Cleanup delete error", "err", err)
 		return
 	}
 	rows, _ := res.RowsAffected()
 	if err := tx.Commit(); err != nil {
-		log.Printf("Cleanup commit error: %v", err)
+		slog.Error("Cleanup commit error", "err", err)
 		return
 	}
 	if rows > 0 {
-		log.Printf("Cleaned up %d expired pastes", rows)
+		slog.Info("Cleaned up expired pastes", "count", rows)
 	}
 }
 
@@ -156,9 +157,13 @@ func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	a.renderViewer(w)
+}
+
+func (a *App) renderViewer(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := a.Tmpl.Execute(w, nil); err != nil {
-		log.Printf("Template execute error: %v", err)
+		slog.Error("Template execute error", "err", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 	}
 }
@@ -170,7 +175,7 @@ func (a *App) serveHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.DB.Ping(); err != nil {
-		log.Printf("Health check failed: DB ping error: %v", err)
+		slog.Error("Health check failed: DB ping error", "err", err)
 		http.Error(w, "unhealthy", http.StatusServiceUnavailable)
 		return
 	}
@@ -252,33 +257,36 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 3 || parts[1] != "p" || parts[2] == "" {
+	if len(parts) != 3 || parts[1] != "p" || parts[2] == "" || len(parts[2]) > 256 {
 		http.NotFound(w, r)
 		return
 	}
 	id := parts[2]
-
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		a.getPaste(w, r, id)
-	} else {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	for _, ch := range id {
+		if !strings.ContainsRune(charset, ch) {
+			http.NotFound(w, r)
+			return
+		}
 	}
-}
 
-func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	accept := r.Header.Get("Accept")
 	isHTML := strings.Contains(accept, "text/html")
+	w.Header().Add("Vary", "Accept")
 
 	if isHTML {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := a.Tmpl.Execute(w, nil); err != nil {
-			log.Printf("Template execute error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-		}
+		a.renderViewer(w)
 		return
 	}
 
+	a.getPaste(w, r, id)
+}
+
+func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	var dataBlob []byte
 	var ivBlob []byte
 	var created time.Time
@@ -287,12 +295,17 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
 		} else {
+			slog.Error("Database query error", "err", err, "id", id)
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 		}
 		return
 	}
 
 	if time.Since(created) > a.ExpDuration {
+		_, delErr := a.DB.Exec("DELETE FROM pastes WHERE id = ?", id)
+		if delErr != nil {
+			slog.Error("Failed to delete expired paste", "id", id, "err", delErr)
+		}
 		http.Error(w, "Paste expired", http.StatusGone)
 		return
 	}
@@ -302,9 +315,8 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"data":    dataB64,
-		"iv":      ivB64,
-		"created": created,
+		"data": dataB64,
+		"iv":   ivB64,
 	})
 }
 
@@ -330,9 +342,14 @@ func randString(length int) string {
 func main() {
 	flag.Parse()
 
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	app, err := NewApp(*dbFile)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Failed to initialize app", "err", err)
+		os.Exit(1)
 	}
 	defer app.Close()
 
@@ -348,6 +365,9 @@ func main() {
 	mux.HandleFunc("/p/", app.servePaste)
 
 	addr := *listenAddr + ":" + *listenPort
-	log.Printf("Server listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, SecurityHeadersMiddleware(mux)))
+	slog.Info("Server listening", "addr", addr)
+	if err := http.ListenAndServe(addr, SecurityHeadersMiddleware(mux)); err != nil {
+		slog.Error("Server failed", "err", err)
+		os.Exit(1)
+	}
 }
