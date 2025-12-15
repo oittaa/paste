@@ -252,23 +252,26 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 3 || parts[1] != "p" || parts[2] == "" {
+	if len(parts) != 3 || parts[1] != "p" || parts[2] == "" || len(parts[2]) > 256 {
 		http.NotFound(w, r)
 		return
 	}
 	id := parts[2]
-
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		a.getPaste(w, r, id)
-	} else {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	for _, ch := range id {
+		if !strings.ContainsRune(charset, ch) {
+			http.NotFound(w, r)
+			return
+		}
 	}
-}
 
-func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	accept := r.Header.Get("Accept")
 	isHTML := strings.Contains(accept, "text/html")
+	w.Header().Add("Vary", "Accept")
 
 	if isHTML {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -279,6 +282,10 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
+	a.getPaste(w, r, id)
+}
+
+func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	var dataBlob []byte
 	var ivBlob []byte
 	var created time.Time
@@ -293,6 +300,10 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	if time.Since(created) > a.ExpDuration {
+		_, delErr := a.DB.Exec("DELETE FROM pastes WHERE id = ?", id)
+		if delErr != nil {
+			log.Printf("Failed to delete expired paste %s: %v", id, delErr)
+		}
 		http.Error(w, "Paste expired", http.StatusGone)
 		return
 	}
@@ -302,9 +313,8 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"data":    dataB64,
-		"iv":      ivB64,
-		"created": created,
+		"data": dataB64,
+		"iv":   ivB64,
 	})
 }
 

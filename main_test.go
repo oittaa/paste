@@ -344,7 +344,7 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected 404 for empty ID, got %d", res.StatusCode)
 		}
 
-		// Test non-GET/HEAD method
+		// Test non-GET method
 		req, err = http.NewRequest("POST", srv.URL+"/p/"+id, nil)
 		if err != nil {
 			t.Fatalf("Failed to create POST request: %v", err)
@@ -355,7 +355,7 @@ func TestAppIntegration(t *testing.T) {
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
+			t.Errorf("Expected 405 for non-GET, got %d", res.StatusCode)
 		}
 	})
 
