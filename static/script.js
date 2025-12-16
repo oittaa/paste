@@ -1,30 +1,36 @@
+const output = document.getElementById('output');
+const viewer = document.getElementById('viewer');
+const code = document.getElementById('code');
+const toggleBtn = document.getElementById('toggleBtn');
+const actionBtn = document.getElementById('actionBtn');
+const copyBtn = document.getElementById('copyBtn');
+const newBtn = document.getElementById('newBtn');
+const statusElem = document.getElementById('status');
+
 const ivLength = 12;
 const tagLength = 128;
-let currentKey = null;
 let isViewMode = false;
 
 function enterEditMode() {
-    document.getElementById('output').style.display = 'block';
-    document.getElementById('viewer').style.display = 'none';
-    document.getElementById('toggleBtn').textContent = 'View';
-    document.getElementById('output').focus();
+    output.style.display = 'block';
+    viewer.style.display = 'none';
+    toggleBtn.textContent = 'View';
+    output.focus();
     isViewMode = false;
 }
 
 function enterViewMode() {
-    const textarea = document.getElementById('output');
-    if (!textarea.value.trim()) {
+    if (!output.value.trim()) {
         enterEditMode();
         return;
     }
-    const code = document.getElementById('code');
     code.className = 'hljs';
     delete code.dataset.highlighted;
-    code.textContent = textarea.value;
+    code.textContent = output.value;
     hljs.highlightElement(code);
-    document.getElementById('viewer').style.display = 'block';
-    document.getElementById('output').style.display = 'none';
-    document.getElementById('toggleBtn').textContent = 'Edit';
+    viewer.style.display = 'block';
+    output.style.display = 'none';
+    toggleBtn.textContent = 'Edit';
     isViewMode = true;
 }
 
@@ -33,10 +39,7 @@ function base64Encode(buffer) {
 }
 
 function base64urlEncode(buffer) {
-    return base64Encode(buffer)
-        .replace(/=/g, '')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_');
+    return new Uint8Array(buffer).toBase64({ alphabet: 'base64url', omitPadding: true });
 }
 
 function base64Decode(str) {
@@ -44,9 +47,7 @@ function base64Decode(str) {
 }
 
 function base64urlDecode(str) {
-    str = str.replace(/-/g, '+').replace(/_/g, '/');
-    while (str.length % 4) str += '=';
-    return base64Decode(str);
+    return Uint8Array.fromBase64(str, { alphabet: 'base64url' });
 }
 
 async function compress(data) {
@@ -65,17 +66,14 @@ async function encrypt(text, key) {
     const compressed = await compress(data);
     const iv = crypto.getRandomValues(new Uint8Array(ivLength));
 
-    const ctBuffer = await crypto.subtle.encrypt({
-            name: 'AES-GCM',
-            iv,
-            tagLength: tagLength
-        },
+    const ctBuffer = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv, tagLength },
         key,
         compressed
     );
 
     return {
-        iv: base64Encode(iv.buffer),
+        iv: base64Encode(iv),
         ct: base64Encode(ctBuffer)
     };
 }
@@ -83,22 +81,18 @@ async function encrypt(text, key) {
 async function decrypt(keyObj, ivStr, ctStr) {
     const iv = base64Decode(ivStr);
     const ct = base64Decode(ctStr);
-    const decBuffer = await crypto.subtle.decrypt({
-            name: 'AES-GCM',
-            iv,
-            tagLength: tagLength
-        },
+    const decBuffer = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv, tagLength },
         keyObj,
         ct
     );
-    const compressed = new Uint8Array(decBuffer);
-    const decompressed = await decompress(compressed);
+    const decompressed = await decompress(new Uint8Array(decBuffer));
     return new TextDecoder().decode(decompressed);
 }
 
 async function createPaste() {
-    const text = document.getElementById('output').value;
-    if (!text.trim()) {
+    const text = output.value.trim();
+    if (!text) {
         showStatus('Empty paste', 'info');
         return;
     }
@@ -111,83 +105,59 @@ async function createPaste() {
         return;
     }
 
-    const button = document.getElementById('actionBtn');
-    button.disabled = true;
-    button.textContent = 'Creating...';
+    actionBtn.disabled = true;
+    actionBtn.textContent = 'Creating...';
 
     try {
-        const key = await crypto.subtle.generateKey({
-                name: 'AES-GCM',
-                length: 256
-            },
-            true,
-            ['encrypt', 'decrypt']
-        );
-        const enc = await encrypt(text, key);
-        const keyBuffer = await crypto.subtle.exportKey('raw', key);
+        const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+        const [enc, keyBuffer] = await Promise.all([
+            encrypt(text, key),
+            crypto.subtle.exportKey('raw', key)
+        ]);
         const keyB64 = base64urlEncode(keyBuffer);
 
         const res = await fetch('/paste', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: JSON.stringify({
-                data: enc.ct,
-                iv: enc.iv
-            }),
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ data: enc.ct, iv: enc.iv }),
             credentials: 'include'
         });
 
         if (!res.ok) {
-            if (res.status === 413) throw new Error('Paste too large');
-            throw new Error('Server error');
+            throw new Error(res.status === 413 ? 'Paste too large' : 'Server error');
         }
 
-        const resp = await res.json();
-        const id = resp.id;
-        const newUrl = '/p/' + id + '#' + keyB64;
-
-        // Update URL without reloading
+        const { id } = await res.json();
+        const newUrl = `/p/${id}#${keyB64}`;
         history.pushState(null, '', newUrl);
-
-        await navigator.clipboard.writeText(window.location.origin + newUrl);
+        await navigator.clipboard.writeText(location.origin + newUrl);
         showStatus('Paste created! URL copied to clipboard.', 'success');
         enterViewMode();
     } catch (e) {
-        let msg = 'Error: ' + e.message;
-        if (e.name === 'TypeError' && e.message.includes('clipboard')) {
-            msg = 'Paste created! Copy URL manually.';
-            showStatus(msg, 'info');
-        } else {
-            showStatus(msg, 'error');
-        }
+        const msg = e.name === 'TypeError' && e.message.includes('clipboard')
+            ? 'Paste created! Copy URL manually.'
+            : `Error: ${e.message}`;
+        showStatus(msg, 'error');
         console.warn('Operation failed:', e);
     } finally {
-        button.disabled = false;
-        button.textContent = 'Create Paste';
+        actionBtn.disabled = false;
+        actionBtn.textContent = 'Create Paste';
     }
 }
 
-function showStatus(msg, type) {
-    const status = document.getElementById('status');
-    status.textContent = msg;
-    status.className = type;
-    status.classList.add('show');
-    setTimeout(() => {
-        status.classList.remove('show');
-    }, 5000);
+function showStatus(msg, type = 'info') {
+    statusElem.textContent = msg;
+    statusElem.className = type;
+    statusElem.classList.add('show');
+    setTimeout(() => statusElem.classList.remove('show'), 5000);
 }
 
 async function copyToClipboard() {
-    const textarea = document.getElementById('output');
-    const text = textarea.value.trim();
+    const text = output.value.trim();
     if (!text) {
         showStatus('Nothing to copy!', 'error');
         return;
     }
-
     try {
         await navigator.clipboard.writeText(text);
         showStatus('Copied to clipboard!', 'success');
@@ -198,60 +168,43 @@ async function copyToClipboard() {
 }
 
 async function loadPaste() {
-    const path = window.location.pathname;
-
-    if (path === '/') {
-        document.getElementById('output').value = '';
+    output.value = '';
+    if (location.pathname === '/') {
         return false;
     }
-
-    document.getElementById('output').value = '';
-
-    const parts = path.split('/');
-    if (parts.length < 3 || parts[1] !== 'p' || !parts[2]) {
-        return false;
-    }
+    const parts = location.pathname.split('/');
+    if (parts.length < 3 || parts[1] !== 'p' || !parts[2]) return false;
 
     const id = parts[2];
-    const hash = window.location.hash.slice(1);
+    const hash = location.hash.slice(1);
 
     let respData;
     try {
-        const res = await fetch('/p/' + id, {
+        const res = await fetch(`/p/${id}`, {
             credentials: 'include',
-            headers: {
-                'Accept': 'application/json'
-            }
+            headers: { 'Accept': 'application/json' }
         });
-
         if (!res.ok) {
             showStatus('Paste not found or expired.', 'error');
             return false;
         }
-
         respData = await res.json();
     } catch (e) {
         showStatus('Network error loading paste.', 'error');
         return false;
     }
 
-    let decryptError = false;
-    let statusMsg = '';
     let hasContent = false;
+    let statusMsg = '';
 
     if (hash) {
         try {
             const keyBytes = base64urlDecode(hash);
-            currentKey = await crypto.subtle.importKey(
-                'raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']
-            );
-
-            // Key imported successfully — attempt decryption
-            const plain = await decrypt(currentKey, respData.iv, respData.data);
-            document.getElementById('output').value = plain;
+            const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
+            const plain = await decrypt(key, respData.iv, respData.data);
+            output.value = plain;
             hasContent = true;
         } catch (e) {
-            decryptError = true;
             console.error('Key import or decryption failed:', e);
             statusMsg = 'Invalid key in URL or decryption failed.';
         }
@@ -259,59 +212,31 @@ async function loadPaste() {
         statusMsg = 'Encrypted paste. Append #key to URL to view.';
     }
 
-    if (statusMsg) {
-        showStatus(statusMsg, decryptError ? 'error' : 'info');
-    }
-
+    if (statusMsg) showStatus(statusMsg, hash && statusMsg.includes('Invalid') ? 'error' : 'info');
     return hasContent;
 }
 
 window.addEventListener('load', () => {
-    const btn = document.getElementById('actionBtn');
-    if (btn) {
-        btn.addEventListener('click', createPaste);
-    }
-    const copyBtn = document.getElementById('copyBtn');
-    if (copyBtn) {
-        copyBtn.addEventListener('click', copyToClipboard);
-    }
-    const newBtn = document.getElementById('newBtn');
+    if (actionBtn) actionBtn.addEventListener('click', createPaste);
+    if (copyBtn) copyBtn.addEventListener('click', copyToClipboard);
     if (newBtn) {
         newBtn.addEventListener('click', () => {
-            document.getElementById('output').value = '';
-            document.getElementById('status').classList.remove('show');
-            currentKey = null;
+            output.value = '';
+            statusElem.classList.remove('show');
             history.pushState(null, '', '/');
             enterEditMode();
         });
     }
-    const toggleBtn = document.getElementById('toggleBtn');
     if (toggleBtn) {
-        toggleBtn.addEventListener('click', () => {
-            if (isViewMode) {
-                enterEditMode();
-            } else {
-                enterViewMode();
-            }
-        });
+        toggleBtn.addEventListener('click', () => isViewMode ? enterEditMode() : enterViewMode());
     }
-    document.addEventListener('keydown', (e) => {
-        if (!isViewMode) return;
-        if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+
+    document.addEventListener('keydown', e => {
+        if (!isViewMode || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
         const key = e.key.toLowerCase();
-        if (key === 'e') {
-            enterEditMode();
-            e.preventDefault();
-        } else if (key === 'c') {
-            copyToClipboard();
-            e.preventDefault();
-        }
+        if (key === 'e') { enterEditMode(); e.preventDefault(); }
+        else if (key === 'c') { copyToClipboard(); e.preventDefault(); }
     });
-    loadPaste().then((hasContent) => {
-        if (hasContent) {
-            enterViewMode();
-        } else {
-            enterEditMode();
-        }
-    });
+
+    loadPaste().then(hasContent => hasContent ? enterViewMode() : enterEditMode());
 });
