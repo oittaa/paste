@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,6 +27,14 @@ const (
 	maxAccept  = 255 - (256 % charsetLen)
 	ivSize     = 12 // AES-GCM IV size in bytes
 )
+
+var validChars [128]bool
+
+func init() {
+	for _, r := range charset {
+		validChars[byte(r)] = true
+	}
+}
 
 //go:embed templates/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
 var content embed.FS
@@ -47,6 +57,7 @@ type App struct {
 	CleanupInterval time.Duration
 	MaxSize         int64
 	writeMu         sync.Mutex
+	AssetVersion    string
 }
 
 func NewApp(dbPath string) (*App, error) {
@@ -72,6 +83,29 @@ func NewApp(dbPath string) (*App, error) {
 		ExpDuration:     time.Duration(*expDays) * 24 * time.Hour,
 		CleanupInterval: *cleanupInterval,
 		MaxSize:         *maxSize,
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		slog.Warn("Failed to get executable path", "err", err)
+	} else {
+		f, err := os.Open(exePath)
+		if err != nil {
+			slog.Warn("Failed to open executable for hashing", "err", err)
+		} else {
+			defer f.Close()
+			h := sha256.New()
+			if _, err := io.Copy(h, f); err != nil {
+				slog.Warn("Failed to hash binary", "err", err)
+			} else {
+				fullHash := h.Sum(nil)
+				app.AssetVersion = base64.RawURLEncoding.EncodeToString(fullHash[:9])
+				slog.Debug("Computed asset version from binary hash", "version", app.AssetVersion)
+			}
+		}
+	}
+	if app.AssetVersion == "" {
+		app.AssetVersion = "devel"
 	}
 
 	if err := app.initDB(); err != nil {
@@ -157,6 +191,7 @@ func (a *App) Close() error {
 func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';")
+		w.Header().Set("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), fullscreen=(), picture-in-picture=()")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -175,8 +210,11 @@ func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) renderViewer(w http.ResponseWriter) {
+	type templateData struct {
+		AssetVersion string
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := a.Tmpl.Execute(w, nil); err != nil {
+	if err := a.Tmpl.Execute(w, templateData{AssetVersion: a.AssetVersion}); err != nil {
 		slog.Error("Template execute error", "err", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 	}
@@ -285,7 +323,7 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[2]
 	for _, ch := range id {
-		if !strings.ContainsRune(charset, ch) {
+		if ch >= 128 || !validChars[byte(ch)] {
 			http.NotFound(w, r)
 			return
 		}
