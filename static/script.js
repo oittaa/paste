@@ -128,16 +128,22 @@ async function createPaste() {
         }
 
         const { id } = await res.json();
-        const newUrl = `/p/${id}#${keyB64}`;
-        history.pushState(null, '', newUrl);
-        await navigator.clipboard.writeText(location.origin + newUrl);
-        showStatus('Paste created! URL copied to clipboard.', 'success');
+        const pasteUrl = `/#${id}:${keyB64}`;
+        history.pushState(null, '', pasteUrl);
+        const fullUrl = location.origin + pasteUrl;
+
+        let copied = false;
+        try {
+            await navigator.clipboard.writeText(fullUrl);
+            copied = true;
+        } catch (e) {
+            console.warn('Clipboard failed:', e);
+        }
+
+        showStatus(copied ? 'Paste created! URL copied to clipboard.' : 'Paste created! Copy URL manually.', copied ? 'success' : 'info');
         enterViewMode();
     } catch (e) {
-        const msg = e.name === 'TypeError' && e.message.includes('clipboard')
-            ? 'Paste created! Copy URL manually.'
-            : `Error: ${e.message}`;
-        showStatus(msg, 'error');
+        showStatus(e.message, 'error');
         console.warn('Operation failed:', e);
     } finally {
         actionBtn.disabled = false;
@@ -169,14 +175,20 @@ async function copyToClipboard() {
 
 async function loadPaste() {
     output.value = '';
-    if (location.pathname === '/') {
+
+    const hash = location.hash.slice(1);
+    if (!hash) {
         return false;
     }
-    const parts = location.pathname.split('/');
-    if (parts.length < 3 || parts[1] !== 'p' || !parts[2]) return false;
 
-    const id = parts[2];
-    const hash = location.hash.slice(1);
+    const colonIdx = hash.indexOf(':');
+    if (colonIdx <= 0 || colonIdx === hash.length - 1) {
+        showStatus('Invalid URL format. Expected #id:key', 'error');
+        return false;
+    }
+
+    const id = hash.slice(0, colonIdx);
+    const keyB64 = hash.slice(colonIdx + 1);
 
     let respData;
     try {
@@ -194,26 +206,17 @@ async function loadPaste() {
         return false;
     }
 
-    let hasContent = false;
-    let statusMsg = '';
-
-    if (hash) {
-        try {
-            const keyBytes = base64urlDecode(hash);
-            const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
-            const plain = await decrypt(key, respData.iv, respData.data);
-            output.value = plain;
-            hasContent = true;
-        } catch (e) {
-            console.error('Key import or decryption failed:', e);
-            statusMsg = 'Invalid key in URL or decryption failed.';
-        }
-    } else {
-        statusMsg = 'Encrypted paste. Append #key to URL to view.';
+    try {
+        const keyBytes = base64urlDecode(keyB64);
+        const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+        const plain = await decrypt(key, respData.iv, respData.data);
+        output.value = plain;
+        return true;
+    } catch (e) {
+        showStatus('Decryption failed. Wrong or invalid key.', 'error');
+        console.error('Decryption error:', e);
+        return false;
     }
-
-    if (statusMsg) showStatus(statusMsg, hash && statusMsg.includes('Invalid') ? 'error' : 'info');
-    return hasContent;
 }
 
 window.addEventListener('load', () => {
