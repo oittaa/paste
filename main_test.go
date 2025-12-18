@@ -223,7 +223,7 @@ func TestAppIntegration(t *testing.T) {
 		json.Unmarshal(createBody, &createResp)
 		id := createResp.ID
 
-		// Test GET /p/{id} with JSON Accept
+		// Test GET /p/{id} with explicit application/json Accept
 		req, err := http.NewRequest("GET", srv.URL+"/p/"+id, nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
@@ -235,7 +235,6 @@ func TestAppIntegration(t *testing.T) {
 		}
 		defer res.Body.Close()
 
-		// Read body once
 		bodyBytes, err := io.ReadAll(res.Body)
 		if err != nil {
 			t.Fatalf("Failed to read body: %v", err)
@@ -243,7 +242,6 @@ func TestAppIntegration(t *testing.T) {
 
 		if res.StatusCode != http.StatusOK {
 			t.Errorf("Expected 200 for valid ID, got %d: %s", res.StatusCode, string(bodyBytes))
-			return
 		}
 		if res.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("Expected Content-Type application/json, got %s", res.Header.Get("Content-Type"))
@@ -263,7 +261,7 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected IV %s, got %s", b64IV, getResp.IV)
 		}
 
-		// Test GET /p/{id} with default Accept (serves JSON)
+		// Test GET /p/{id} with default Accept header (still serves JSON)
 		req, err = http.NewRequest("GET", srv.URL+"/p/"+id, nil)
 		if err != nil {
 			t.Fatalf("Failed to create default request: %v", err)
@@ -284,29 +282,30 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected Content-Type application/json for default accept, got %s", res.Header.Get("Content-Type"))
 		}
 
-		// Test GET /p/{id} with HTML Accept (serves template)
+		// Test GET /p/{id} with text/html Accept (still serves JSON - /p/ is pure API)
 		req, err = http.NewRequest("GET", srv.URL+"/p/"+id, nil)
 		if err != nil {
-			t.Fatalf("Failed to create HTML request: %v", err)
+			t.Fatalf("Failed to create text/html request: %v", err)
 		}
 		req.Header.Set("Accept", "text/html")
 		res, err = srv.Client().Do(req)
 		if err != nil {
-			t.Fatalf("Failed to GET HTML /p/%s: %v", id, err)
+			t.Fatalf("Failed to GET text/html /p/%s: %v", id, err)
 		}
 		defer res.Body.Close()
 		bodyBytes, err = io.ReadAll(res.Body)
 		if err != nil {
-			t.Fatalf("Failed to read HTML body: %v", err)
+			t.Fatalf("Failed to read text/html body: %v", err)
 		}
 		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected 200 for HTML, got %d", res.StatusCode)
+			t.Errorf("Expected 200 even when requesting text/html, got %d", res.StatusCode)
 		}
-		if res.Header.Get("Content-Type") != "text/html; charset=utf-8" {
-			t.Errorf("Expected Content-Type text/html; charset=utf-8 for HTML accept, got %s", res.Header.Get("Content-Type"))
+		if res.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("Expected Content-Type application/json even when requesting text/html, got %s", res.Header.Get("Content-Type"))
 		}
-		if !strings.Contains(string(bodyBytes), "<title>Paste</title>") {
-			t.Errorf("Expected HTML template for HTML accept")
+		// Quick sanity check that it's valid JSON with expected fields
+		if err := json.Unmarshal(bodyBytes, &getResp); err != nil {
+			t.Errorf("Response body should be valid JSON even with text/html Accept: %v", err)
 		}
 
 		// Test non-existent ID
@@ -324,7 +323,7 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected 404 for nonexistent ID, got %d", res.StatusCode)
 		}
 
-		// Test invalid path
+		// Test invalid path (empty ID)
 		req, err = http.NewRequest("GET", srv.URL+"/p/", nil)
 		if err != nil {
 			t.Fatalf("Failed to create empty ID request: %v", err)

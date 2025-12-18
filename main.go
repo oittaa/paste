@@ -36,7 +36,7 @@ func init() {
 	}
 }
 
-//go:embed templates/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
+//go:embed templates/index.html static/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
 var content embed.FS
 
 var (
@@ -141,11 +141,36 @@ func (a *App) initDB() error {
 	if err != nil {
 		return err
 	}
+	_, err = a.DB.Exec("PRAGMA auto_vacuum = INCREMENTAL")
+	if err != nil {
+		slog.Warn("Failed to enable incremental auto_vacuum", "err", err)
+	}
 	return nil
 }
 
-func (a *App) StartCleanup() {
+func (a *App) StartBackgroundTasks() {
+	go a.incrementalVacuumGoroutine()
 	go a.cleanupGoroutine()
+}
+
+func (a *App) incrementalVacuumGoroutine() {
+	time.Sleep(30 * time.Second)
+	a.runIncrementalVacuum()
+
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		a.runIncrementalVacuum()
+	}
+}
+
+func (a *App) runIncrementalVacuum() {
+	_, err := a.DB.Exec("PRAGMA incremental_vacuum")
+	if err != nil {
+		slog.Error("Incremental vacuum failed", "err", err)
+		return
+	}
+	slog.Info("Incremental vacuum completed")
 }
 
 func (a *App) runCleanup() {
@@ -199,6 +224,13 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func cacheStatic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Handlers as methods on *App
 
 func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
@@ -206,14 +238,25 @@ func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	a.renderViewer(w)
+	a.serveHTML(w, r)
 }
 
-func (a *App) renderViewer(w http.ResponseWriter) {
+func (a *App) serveHTML(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=14400")
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
 	type templateData struct {
 		AssetVersion string
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := a.Tmpl.Execute(w, templateData{AssetVersion: a.AssetVersion}); err != nil {
 		slog.Error("Template execute error", "err", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -312,7 +355,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -327,15 +370,6 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-	}
-
-	accept := r.Header.Get("Accept")
-	isHTML := strings.Contains(accept, "text/html")
-	w.Header().Add("Vary", "Accept")
-
-	if isHTML {
-		a.renderViewer(w)
-		return
 	}
 
 	a.getPaste(w, r, id)
@@ -356,11 +390,10 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	if time.Since(created) > a.ExpDuration {
-		_, delErr := a.DB.Exec("DELETE FROM pastes WHERE id = ?", id)
-		if delErr != nil {
-			slog.Error("Failed to delete expired paste", "id", id, "err", delErr)
-		}
+	expiresAt := created.Add(a.ExpDuration)
+	secondsUntilExpiry := time.Until(expiresAt).Seconds()
+
+	if secondsUntilExpiry <= 0 {
 		http.Error(w, "Paste expired", http.StatusGone)
 		return
 	}
@@ -369,6 +402,7 @@ func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
 	ivB64 := base64.StdEncoding.EncodeToString(ivBlob)
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", int(secondsUntilExpiry)))
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"data": dataB64,
 		"iv":   ivB64,
@@ -408,11 +442,11 @@ func main() {
 	}
 	defer app.Close()
 
-	app.StartCleanup()
+	app.StartBackgroundTasks()
 
 	mux := http.NewServeMux()
 
-	mux.Handle("/static/", http.FileServer(http.FS(content)))
+	mux.Handle("/static/", cacheStatic(http.FileServer(http.FS(content))))
 
 	mux.HandleFunc("/", app.serveIndex)
 	mux.HandleFunc("/health", app.serveHealth)
