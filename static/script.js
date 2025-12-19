@@ -10,6 +10,7 @@ const statusElem = document.getElementById('status');
 const ivLength = 12;
 const tagLength = 128;
 let isViewMode = false;
+let currentSequence = 0;
 
 function enterEditMode() {
     output.style.display = 'block';
@@ -91,8 +92,8 @@ async function decrypt(keyObj, ivStr, ctStr) {
 }
 
 async function createPaste() {
-    const text = output.value.trim();
-    if (!text) {
+    const text = output.value;
+    if (text.trim() === '') {
         showStatus('Empty paste', 'info');
         return;
     }
@@ -159,8 +160,8 @@ function showStatus(msg, type = 'info') {
 }
 
 async function copyToClipboard() {
-    const text = output.value.trim();
-    if (!text) {
+    const text = output.value;
+    if (text.trim() === '') {
         showStatus('Nothing to copy!', 'error');
         return;
     }
@@ -219,15 +220,28 @@ async function loadPaste() {
     }
 }
 
+async function handleLocation() {
+    currentSequence = ++currentSequence % (10 ** 9 + 7);
+    const thisSequence = currentSequence;
+    const loaded = await loadPaste();
+    if (thisSequence !== currentSequence) {
+        return;
+    }
+    if (loaded) {
+        enterViewMode();
+    } else {
+        enterEditMode();
+    }
+}
+
 window.addEventListener('load', () => {
     if (actionBtn) actionBtn.addEventListener('click', createPaste);
     if (copyBtn) copyBtn.addEventListener('click', copyToClipboard);
     if (newBtn) {
         newBtn.addEventListener('click', () => {
-            output.value = '';
             statusElem.classList.remove('show');
             history.pushState(null, '', '/');
-            enterEditMode();
+            handleLocation();
         });
     }
     if (toggleBtn) {
@@ -241,5 +255,7 @@ window.addEventListener('load', () => {
         else if (key === 'c') { copyToClipboard(); e.preventDefault(); }
     });
 
-    loadPaste().then(hasContent => hasContent ? enterViewMode() : enterEditMode());
+    handleLocation();
 });
+window.addEventListener('hashchange', handleLocation);
+window.addEventListener('popstate', handleLocation);
