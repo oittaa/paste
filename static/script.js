@@ -21,14 +21,22 @@ function enterEditMode() {
 }
 
 function enterViewMode() {
-    if (!output.value.trim()) {
+    if (output.value.trim() === '') {
         enterEditMode();
         return;
     }
     code.className = 'hljs';
     delete code.dataset.highlighted;
     code.textContent = output.value;
-    hljs.highlightElement(code);
+    if (typeof hljs !== 'undefined' && typeof hljs.highlightElement === 'function') {
+        try {
+            hljs.highlightElement(code);
+        } catch (e) {
+            console.warn('Highlight.js highlighting failed:', e);
+        }
+    } else {
+        console.warn('Highlight.js not available – displaying plain text with theme base styles');
+    }
     viewer.style.display = 'block';
     output.style.display = 'none';
     toggleBtn.textContent = 'Edit';
@@ -154,6 +162,7 @@ async function createPaste() {
 
 function showStatus(msg, type = 'info') {
     statusElem.textContent = msg;
+    statusElem.title = msg;
     statusElem.className = type;
     statusElem.classList.add('show');
     setTimeout(() => statusElem.classList.remove('show'), 5000);
