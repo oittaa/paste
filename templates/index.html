@@ -17,12 +17,14 @@
         </div>
     </div>
     <div id="button-container">
-        <button id="newBtn">New</button>
-        <button id="copyBtn">Copy</button>
-        <button id="toggleBtn">View</button>
-        <button id="actionBtn">Create Paste</button>
+        <div id="status"></div>
+        <div class="buttons">
+            <button id="newBtn">New</button>
+            <button id="copyBtn">Copy</button>
+            <button id="toggleBtn">View</button>
+            <button id="actionBtn">Create Paste</button>
+        </div>
     </div>
-    <div id="status"></div>
     <script src="/static/highlight.min.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
     <script src="/static/script.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
 </body>
