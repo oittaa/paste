@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
@@ -28,7 +29,18 @@ const (
 	ivSize     = 12 // AES-GCM IV size in bytes
 )
 
-var validChars [128]bool
+var (
+	ErrPasteNotFound = errors.New("paste not found")
+	ErrPasteExpired  = errors.New("paste expired")
+	validChars       [128]bool
+	dbFile           = flag.String("db", "pastes.db", "SQLite DB file (use ':memory:' for in-mem)")
+	idLength         = flag.Int("idlen", 8, "Default paste ID length")
+	expDays          = flag.Int("expdays", 30, "Paste expiration days")
+	cleanupInterval  = flag.Duration("cleanup-interval", time.Hour, "Cleanup interval")
+	maxSize          = flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
+	listenAddr       = flag.String("addr", "0.0.0.0", "Listen address")
+	listenPort       = flag.String("port", "8080", "Listen port")
+)
 
 func init() {
 	for _, r := range charset {
@@ -39,15 +51,11 @@ func init() {
 //go:embed templates/index.html static/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
 var content embed.FS
 
-var (
-	dbFile          = flag.String("db", "pastes.db", "SQLite DB file (use ':memory:' for in-mem)")
-	idLength        = flag.Int("idlen", 8, "Default paste ID length")
-	expDays         = flag.Int("expdays", 30, "Paste expiration days")
-	cleanupInterval = flag.Duration("cleanup-interval", time.Hour, "Cleanup interval")
-	maxSize         = flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
-	listenAddr      = flag.String("addr", "0.0.0.0", "Listen address")
-	listenPort      = flag.String("port", "8080", "Listen port")
-)
+type PasteContent struct {
+	Data    []byte
+	IV      []byte
+	Created time.Time
+}
 
 type App struct {
 	DB              *sql.DB
@@ -320,35 +328,42 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	id, err := a.InsertPaste(decodedData, decodedIV)
+	if err != nil {
+		slog.Error("Failed to insert paste", "err", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"id": id})
+}
+
+func (a *App) InsertPaste(data, iv []byte) (string, error) {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 
-	var id string
 	length := a.IDLength
-	maxRetries := 100
 	retries := 0
+
 	for {
-		id = randString(length)
-		res, err := a.DB.Exec("INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)",
-			id, decodedData, decodedIV)
+		id := randString(length)
+		res, err := a.DB.Exec("INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)", id, data, iv)
 		if err == nil {
 			rows, _ := res.RowsAffected()
 			if rows == 1 {
-				break
+				return id, nil
 			}
 		}
+
 		retries++
-		if retries >= maxRetries {
-			http.Error(w, "Server error", http.StatusInternalServerError)
-			return
+		if retries >= 100 {
+			return "", fmt.Errorf("insert failed after %d retries", retries)
 		}
 		if retries%10 == 0 {
 			length++
 		}
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"id": id})
 }
 
 func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
@@ -369,41 +384,53 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	a.getPaste(w, r, id)
-}
-
-func (a *App) getPaste(w http.ResponseWriter, r *http.Request, id string) {
-	var dataBlob []byte
-	var ivBlob []byte
-	var created time.Time
-	err := a.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).Scan(&dataBlob, &ivBlob, &created)
+	content, err := a.LoadPaste(id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, ErrPasteNotFound) {
 			http.NotFound(w, r)
+		} else if errors.Is(err, ErrPasteExpired) {
+			http.Error(w, "Paste expired", http.StatusGone)
 		} else {
-			slog.Error("Database query error", "err", err, "id", id)
+			slog.Error("LoadPaste failed", "err", err, "id", id)
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 		}
 		return
 	}
 
-	expiresAt := created.Add(a.ExpDuration)
-	secondsUntilExpiry := time.Until(expiresAt).Seconds()
+	secondsUntilExpiry := max(int(time.Until(content.Created.Add(a.ExpDuration)).Seconds()), 1)
 
-	if secondsUntilExpiry <= 0 {
-		http.Error(w, "Paste expired", http.StatusGone)
-		return
-	}
-
-	dataB64 := base64.StdEncoding.EncodeToString(dataBlob)
-	ivB64 := base64.StdEncoding.EncodeToString(ivBlob)
-
+	dataB64 := base64.StdEncoding.EncodeToString(content.Data)
+	ivB64 := base64.StdEncoding.EncodeToString(content.IV)
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", int(secondsUntilExpiry)))
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", secondsUntilExpiry))
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"data": dataB64,
 		"iv":   ivB64,
 	})
+}
+
+func (a *App) LoadPaste(id string) (*PasteContent, error) {
+	var dataBlob, ivBlob []byte
+	var created time.Time
+
+	err := a.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).
+		Scan(&dataBlob, &ivBlob, &created)
+	if err == sql.ErrNoRows {
+		return nil, ErrPasteNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db query error: %w", err)
+	}
+
+	if time.Until(created.Add(a.ExpDuration)) <= 0 {
+		return nil, ErrPasteExpired
+	}
+
+	return &PasteContent{
+		Data:    dataBlob,
+		IV:      ivBlob,
+		Created: created,
+	}, nil
 }
 
 func randString(length int) string {
