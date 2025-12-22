@@ -428,6 +428,22 @@ func randString(length int) string {
 	return string(b)
 }
 
+func newHandler(app *App) http.Handler {
+	mux := http.NewServeMux()
+
+	// Static files with long-term caching (immutable)
+	mux.Handle("/static/", cacheStatic(http.FileServer(http.FS(content))))
+
+	// Routes
+	mux.HandleFunc("/", app.serveIndex)
+	mux.HandleFunc("/health", app.serveHealth)
+	mux.HandleFunc("/paste", app.serveCreate)
+	mux.HandleFunc("/p/", app.servePaste)
+
+	// Apply security headers to everything
+	return SecurityHeadersMiddleware(mux)
+}
+
 func main() {
 	flag.Parse()
 
@@ -444,18 +460,9 @@ func main() {
 
 	app.StartBackgroundTasks()
 
-	mux := http.NewServeMux()
-
-	mux.Handle("/static/", cacheStatic(http.FileServer(http.FS(content))))
-
-	mux.HandleFunc("/", app.serveIndex)
-	mux.HandleFunc("/health", app.serveHealth)
-	mux.HandleFunc("/paste", app.serveCreate)
-	mux.HandleFunc("/p/", app.servePaste)
-
 	addr := *listenAddr + ":" + *listenPort
 	slog.Info("Server listening", "addr", addr)
-	if err := http.ListenAndServe(addr, SecurityHeadersMiddleware(mux)); err != nil {
+	if err := http.ListenAndServe(addr, newHandler(app)); err != nil {
 		slog.Error("Server failed", "err", err)
 		os.Exit(1)
 	}
