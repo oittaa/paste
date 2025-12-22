@@ -76,12 +76,28 @@ func TestAppIntegration(t *testing.T) {
 		}
 		body, _ = io.ReadAll(res.Body)
 		if len(body) != 0 {
-			t.Errorf("Expected empty body on HEAD, got %s", string(body))
+			t.Errorf("Expected empty body on HEAD, got %d bytes", len(body))
+		}
+		assertSecurityHeaders(t, res)
+
+		// Invalid method (POST)
+		req, err = http.NewRequest("POST", srv.URL+"/health", nil)
+		if err != nil {
+			t.Fatalf("Failed to create POST request: %v", err)
+		}
+		res, err = srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("Failed to POST /health: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("Expected 405 for POST /health, got %d", res.StatusCode)
 		}
 		assertSecurityHeaders(t, res)
 	})
 
 	t.Run("IndexHandler", func(t *testing.T) {
+		// GET
 		res, err := srv.Client().Get(srv.URL + "/")
 		if err != nil {
 			t.Fatalf("Failed to GET /: %v", err)
@@ -102,7 +118,44 @@ func TestAppIntegration(t *testing.T) {
 		}
 		assertSecurityHeaders(t, res)
 
-		// Test 404 for invalid path
+		// HEAD
+		req, err := http.NewRequest("HEAD", srv.URL+"/", nil)
+		if err != nil {
+			t.Fatalf("Failed to create HEAD request: %v", err)
+		}
+		res, err = srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("Failed to HEAD /: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 for HEAD /, got %d", res.StatusCode)
+		}
+		body, _ = io.ReadAll(res.Body)
+		if len(body) != 0 {
+			t.Errorf("Expected empty body on HEAD /, got %d bytes", len(body))
+		}
+		if res.Header.Get("Cache-Control") != "public, max-age=14400" {
+			t.Errorf("Wrong Cache-Control on HEAD /")
+		}
+		assertSecurityHeaders(t, res)
+
+		// Invalid method (POST)
+		req, err = http.NewRequest("POST", srv.URL+"/", nil)
+		if err != nil {
+			t.Fatalf("Failed to create POST request: %v", err)
+		}
+		res, err = srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("Failed to POST /: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("Expected 405 for POST /, got %d", res.StatusCode)
+		}
+		assertSecurityHeaders(t, res)
+
+		// 404 for invalid path
 		res, err = srv.Client().Get(srv.URL + "/invalid")
 		if err != nil {
 			t.Fatalf("Failed to GET /invalid: %v", err)
@@ -115,7 +168,6 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("StaticHandler", func(t *testing.T) {
-		// Test a few static assets to cover cacheStatic middleware
 		for _, path := range []string{"/static/styles.css", "/static/script.js", "/static/favicon.jpg"} {
 			t.Run(path, func(t *testing.T) {
 				res, err := srv.Client().Get(srv.URL + path)
@@ -135,102 +187,153 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("CreateHandler", func(t *testing.T) {
-		// Prepare fake encrypted data and IV
-		fakeEncData := []byte("test paste content [fake encrypted]")
-		b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
-
-		iv := make([]byte, ivSize)
-		if _, err := rand.Read(iv); err != nil {
-			t.Fatalf("Failed to generate IV: %v", err)
+		validIV := make([]byte, ivSize)
+		if _, err := rand.Read(validIV); err != nil {
+			t.Fatalf("Failed to generate valid IV: %v", err)
 		}
-		b64IV := base64.StdEncoding.EncodeToString(iv)
+		b64ValidIV := base64.StdEncoding.EncodeToString(validIV)
 
-		reqBody, err := json.Marshal(map[string]string{
-			"data": b64Data,
-			"iv":   b64IV,
+		t.Run("ValidCreate", func(t *testing.T) {
+			fakeEncData := []byte("test paste content [fake encrypted]")
+			b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
+
+			reqBody, err := json.Marshal(map[string]string{
+				"data": b64Data,
+				"iv":   b64ValidIV,
+			})
+			if err != nil {
+				t.Fatalf("Failed to marshal request: %v", err)
+			}
+
+			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+			if err != nil {
+				t.Fatalf("Failed to POST /paste: %v", err)
+			}
+			defer res.Body.Close()
+
+			bodyBytes, _ := io.ReadAll(res.Body)
+			if res.StatusCode != http.StatusOK {
+				t.Errorf("Expected status 200, got %d: %s", res.StatusCode, string(bodyBytes))
+			}
+			assertSecurityHeaders(t, res)
+
+			var resp struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(bodyBytes, &resp); err != nil {
+				t.Fatalf("Failed to unmarshal response: %v", err)
+			}
+			if resp.ID == "" {
+				t.Error("Expected non-empty ID in response")
+			}
+			if len(resp.ID) != app.IDLength {
+				t.Errorf("Expected ID length %d, got %d", app.IDLength, len(resp.ID))
+			}
 		})
-		if err != nil {
-			t.Fatalf("Failed to marshal request: %v", err)
-		}
 
-		res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-		if err != nil {
-			t.Fatalf("Failed to POST /paste: %v", err)
-		}
-		defer res.Body.Close()
+		t.Run("InvalidJSON", func(t *testing.T) {
+			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader([]byte(`{invalid`)))
+			if err != nil {
+				t.Fatalf("Failed to POST invalid JSON: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("Expected 400 for invalid JSON, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
 
-		bodyBytes, _ := io.ReadAll(res.Body)
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200, got %d: %s", res.StatusCode, string(bodyBytes))
-		}
-		assertSecurityHeaders(t, res)
+		t.Run("RequestTooLargePreDecode", func(t *testing.T) {
+			hugeBase64 := strings.Repeat("A", int(app.MaxSize*3/2+20000))
+			reqBody, _ := json.Marshal(map[string]string{
+				"data": hugeBase64,
+				"iv":   b64ValidIV,
+			})
 
-		var resp struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(bodyBytes, &resp); err != nil {
-			t.Fatalf("Failed to unmarshal response: %v", err)
-		}
-		if resp.ID == "" {
-			t.Error("Expected non-empty ID in response")
-		}
-		if len(resp.ID) != app.IDLength {
-			t.Errorf("Expected ID length %d, got %d", app.IDLength, len(resp.ID))
-		}
+			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+			if err != nil {
+				t.Fatalf("Failed to POST huge request: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Errorf("Expected 413 Request too large (MaxBytesReader), got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
 
-		// Invalid JSON
-		res, err = srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader([]byte(`{invalid`)))
-		if err != nil {
-			t.Fatalf("Failed to POST invalid JSON: %v", err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusBadRequest {
-			t.Errorf("Expected 400 for invalid JSON, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
+		t.Run("InvalidBase64Data", func(t *testing.T) {
+			reqBody, _ := json.Marshal(map[string]string{
+				"data": "!!!invalid-base64!!!",
+				"iv":   b64ValidIV,
+			})
 
-		// Oversized data (post-decode)
-		oversized := make([]byte, int(app.MaxSize)+1)
-		b64Oversized := base64.StdEncoding.EncodeToString(oversized)
-		oversizedReq, _ := json.Marshal(map[string]string{"data": b64Oversized, "iv": b64IV})
-		res, err = srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(oversizedReq))
-		if err != nil {
-			t.Fatalf("Failed to POST oversized: %v", err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusRequestEntityTooLarge {
-			t.Errorf("Expected 413 for oversized, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
+			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+			if err != nil {
+				t.Fatalf("Failed to POST invalid base64: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("Expected 400 for invalid base64 data, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
 
-		// Invalid IV length
-		invalidIV := make([]byte, ivSize-1)
-		b64InvalidIV := base64.StdEncoding.EncodeToString(invalidIV)
-		invalidReq, _ := json.Marshal(map[string]string{"data": b64Data, "iv": b64InvalidIV})
-		res, err = srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(invalidReq))
-		if err != nil {
-			t.Fatalf("Failed to POST invalid IV: %v", err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusBadRequest {
-			t.Errorf("Expected 400 for invalid IV, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
+		t.Run("OversizedPostDecode", func(t *testing.T) {
+			oversized := make([]byte, int(app.MaxSize)+1)
+			b64Oversized := base64.StdEncoding.EncodeToString(oversized)
+			reqBody, _ := json.Marshal(map[string]string{
+				"data": b64Oversized,
+				"iv":   b64ValidIV,
+			})
 
-		// Non-POST method
-		res, err = srv.Client().Get(srv.URL + "/paste")
-		if err != nil {
-			t.Fatalf("Failed to GET /paste: %v", err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for non-POST, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
+			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+			if err != nil {
+				t.Fatalf("Failed to POST oversized: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Errorf("Expected 413 for oversized decoded data, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
+
+		t.Run("InvalidIVLength", func(t *testing.T) {
+			invalidIV := make([]byte, ivSize-1)
+			b64InvalidIV := base64.StdEncoding.EncodeToString(invalidIV)
+
+			smallData := []byte("small")
+			b64Data := base64.StdEncoding.EncodeToString(smallData)
+			reqBody, _ := json.Marshal(map[string]string{
+				"data": b64Data,
+				"iv":   b64InvalidIV,
+			})
+
+			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+			if err != nil {
+				t.Fatalf("Failed to POST invalid IV: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("Expected 400 for invalid IV length, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
+
+		t.Run("NonPostMethod", func(t *testing.T) {
+			res, err := srv.Client().Get(srv.URL + "/paste")
+			if err != nil {
+				t.Fatalf("Failed to GET /paste: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("Expected 405 for non-POST, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
 	})
 
 	t.Run("PasteHandler", func(t *testing.T) {
-		// Create a paste to retrieve
+		// Create a paste for retrieval tests
 		fakeEncData := []byte("retrievable paste [fake encrypted]")
 		b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
 		iv := make([]byte, ivSize)
@@ -239,138 +342,155 @@ func TestAppIntegration(t *testing.T) {
 		}
 		b64IV := base64.StdEncoding.EncodeToString(iv)
 
-		createReq, _ := json.Marshal(map[string]string{"data": b64Data, "iv": b64IV})
-		createRes, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(createReq))
+		createReqBody, _ := json.Marshal(map[string]string{"data": b64Data, "iv": b64IV})
+		createRes, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(createReqBody))
 		if err != nil {
-			t.Fatalf("Failed to create paste: %v", err)
+			t.Fatalf("Failed to create paste for PasteHandler tests: %v", err)
 		}
 		defer createRes.Body.Close()
+
+		if createRes.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to create paste: expected 200, got %d", createRes.StatusCode)
+		}
+
 		createBody, _ := io.ReadAll(createRes.Body)
-		var createResp struct{ ID string }
-		json.Unmarshal(createBody, &createResp)
+		var createResp struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(createBody, &createResp); err != nil {
+			t.Fatalf("Failed to unmarshal create response: %v", err)
+		}
 		id := createResp.ID
+		if id == "" {
+			t.Fatal("Created paste has empty ID")
+		}
 
-		// GET (various Accept headers - always JSON)
-		for _, accept := range []string{"application/json", "", "text/html"} {
-			t.Run("GET Accept="+accept, func(t *testing.T) {
-				req, err := http.NewRequest("GET", srv.URL+"/p/"+id, nil)
-				if err != nil {
-					t.Fatalf("Failed to create request: %v", err)
-				}
-				if accept != "" {
-					req.Header.Set("Accept", accept)
-				}
-				res, err := srv.Client().Do(req)
-				if err != nil {
-					t.Fatalf("Failed to GET /p/%s: %v", id, err)
-				}
-				defer res.Body.Close()
-
-				if res.StatusCode != http.StatusOK {
-					t.Errorf("Expected 200, got %d", res.StatusCode)
-				}
-				if res.Header.Get("Content-Type") != "application/json" {
-					t.Errorf("Expected application/json Content-Type, got %s", res.Header.Get("Content-Type"))
-				}
-				cache := res.Header.Get("Cache-Control")
-				if !strings.Contains(cache, "public") || !strings.Contains(cache, "immutable") || !strings.Contains(cache, "max-age=") {
-					t.Errorf("Expected public, immutable, max-age in Cache-Control, got %q", cache)
-				}
-				assertSecurityHeaders(t, res)
-
-				bodyBytes, _ := io.ReadAll(res.Body)
-				var getResp struct {
-					Data string `json:"data"`
-					IV   string `json:"iv"`
-				}
-				if err := json.Unmarshal(bodyBytes, &getResp); err != nil {
-					t.Errorf("Response not valid JSON: %v", err)
-				} else {
-					if getResp.Data != b64Data {
-						t.Errorf("Data mismatch")
+		t.Run("GETVariousAccept", func(t *testing.T) {
+			for _, accept := range []string{"application/json", "", "text/html"} {
+				t.Run("Accept="+accept, func(t *testing.T) {
+					req, err := http.NewRequest("GET", srv.URL+"/p/"+id, nil)
+					if err != nil {
+						t.Fatalf("Failed to create request: %v", err)
 					}
-					if getResp.IV != b64IV {
-						t.Errorf("IV mismatch")
+					if accept != "" {
+						req.Header.Set("Accept", accept)
 					}
-				}
-			})
-		}
+					res, err := srv.Client().Do(req)
+					if err != nil {
+						t.Fatalf("Failed to GET /p/%s: %v", id, err)
+					}
+					defer res.Body.Close()
 
-		// HEAD (currently sends body - this is a known issue, but we test headers)
-		req, err := http.NewRequest("HEAD", srv.URL+"/p/"+id, nil)
-		if err != nil {
-			t.Fatalf("Failed to create HEAD request: %v", err)
-		}
-		res, err := srv.Client().Do(req)
-		if err != nil {
-			t.Fatalf("Failed to HEAD /p/%s: %v", id, err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected 200 for HEAD, got %d", res.StatusCode)
-		}
-		if res.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("Expected application/json on HEAD, got %s", res.Header.Get("Content-Type"))
-		}
-		cache := res.Header.Get("Cache-Control")
-		if !strings.Contains(cache, "public") || !strings.Contains(cache, "immutable") {
-			t.Errorf("Expected public, immutable in HEAD Cache-Control, got %q", cache)
-		}
-		assertSecurityHeaders(t, res)
+					if res.StatusCode != http.StatusOK {
+						t.Errorf("Expected 200, got %d", res.StatusCode)
+					}
+					if res.Header.Get("Content-Type") != "application/json" {
+						t.Errorf("Expected application/json Content-Type, got %s", res.Header.Get("Content-Type"))
+					}
+					cache := res.Header.Get("Cache-Control")
+					if !strings.Contains(cache, "public") || !strings.Contains(cache, "immutable") || !strings.Contains(cache, "max-age=") {
+						t.Errorf("Expected public, immutable, max-age in Cache-Control, got %q", cache)
+					}
+					assertSecurityHeaders(t, res)
 
-		// Non-existent ID
-		res, err = srv.Client().Get(srv.URL + "/p/nonexistent")
-		if err != nil {
-			t.Fatalf("Failed to GET nonexistent: %v", err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected 404 for nonexistent, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
+					bodyBytes, _ := io.ReadAll(res.Body)
+					var getResp struct {
+						Data string `json:"data"`
+						IV   string `json:"iv"`
+					}
+					if err := json.Unmarshal(bodyBytes, &getResp); err != nil {
+						t.Errorf("Response not valid JSON: %v", err)
+					} else {
+						if getResp.Data != b64Data {
+							t.Errorf("Data mismatch")
+						}
+						if getResp.IV != b64IV {
+							t.Errorf("IV mismatch")
+						}
+					}
+				})
+			}
+		})
 
-		// Invalid characters in ID
-		res, err = srv.Client().Get(srv.URL + "/p/abc!€$")
-		if err != nil {
-			t.Fatalf("Failed to GET invalid chars: %v", err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected 404 for invalid chars, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
-
-		// Invalid path (empty ID, too many parts, etc.)
-		for _, path := range []string{"/p/", "/p", "/a/b/c"} {
-			res, err = srv.Client().Get(srv.URL + path)
+		t.Run("HEAD", func(t *testing.T) {
+			req, err := http.NewRequest("HEAD", srv.URL+"/p/"+id, nil)
 			if err != nil {
-				t.Fatalf("Failed to GET %s: %v", path, err)
+				t.Fatalf("Failed to create HEAD request: %v", err)
+			}
+			res, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("Failed to HEAD /p/%s: %v", id, err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				t.Errorf("Expected 200 for HEAD, got %d", res.StatusCode)
+			}
+			if res.Header.Get("Content-Type") != "application/json" {
+				t.Errorf("Expected application/json on HEAD, got %s", res.Header.Get("Content-Type"))
+			}
+			cache := res.Header.Get("Cache-Control")
+			if !strings.Contains(cache, "public") || !strings.Contains(cache, "immutable") {
+				t.Errorf("Expected public, immutable in HEAD Cache-Control, got %q", cache)
+			}
+			assertSecurityHeaders(t, res)
+		})
+
+		t.Run("NonExistent", func(t *testing.T) {
+			res, err := srv.Client().Get(srv.URL + "/p/nonexistent")
+			if err != nil {
+				t.Fatalf("Failed to GET nonexistent: %v", err)
 			}
 			defer res.Body.Close()
 			if res.StatusCode != http.StatusNotFound {
-				t.Errorf("Expected 404 for %s, got %d", path, res.StatusCode)
+				t.Errorf("Expected 404 for nonexistent, got %d", res.StatusCode)
 			}
 			assertSecurityHeaders(t, res)
-		}
+		})
 
-		// Non-GET/HEAD method
-		req, err = http.NewRequest("POST", srv.URL+"/p/"+id, nil)
-		if err != nil {
-			t.Fatalf("Failed to create POST request: %v", err)
-		}
-		res, err = srv.Client().Do(req)
-		if err != nil {
-			t.Fatalf("Failed to POST /p/%s: %v", id, err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
+		t.Run("InvalidCharacters", func(t *testing.T) {
+			res, err := srv.Client().Get(srv.URL + "/p/abc!€$")
+			if err != nil {
+				t.Fatalf("Failed to GET invalid chars: %v", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusNotFound {
+				t.Errorf("Expected 404 for invalid chars, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
+
+		t.Run("InvalidPaths", func(t *testing.T) {
+			for _, path := range []string{"/p/", "/p", "/a/b/c"} {
+				res, err := srv.Client().Get(srv.URL + path)
+				if err != nil {
+					t.Fatalf("Failed to GET %s: %v", path, err)
+				}
+				defer res.Body.Close()
+				if res.StatusCode != http.StatusNotFound {
+					t.Errorf("Expected 404 for %s, got %d", path, res.StatusCode)
+				}
+				assertSecurityHeaders(t, res)
+			}
+		})
+
+		t.Run("NonGetHeadMethod", func(t *testing.T) {
+			req, err := http.NewRequest("POST", srv.URL+"/p/"+id, nil)
+			if err != nil {
+				t.Fatalf("Failed to create POST request: %v", err)
+			}
+			res, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("Failed to POST /p/%s: %v", id, err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
+			}
+			assertSecurityHeaders(t, res)
+		})
 	})
 
 	t.Run("Expiration", func(t *testing.T) {
-		// Manually insert expired paste
 		_, err := app.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', '-31 days'))`,
 			"expired", []byte("data"), make([]byte, ivSize))
 		if err != nil {
@@ -387,7 +507,6 @@ func TestAppIntegration(t *testing.T) {
 		}
 		assertSecurityHeaders(t, res)
 
-		// Fresh paste
 		_, err = app.DB.Exec(`INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)`,
 			"fresh", []byte("data"), make([]byte, ivSize))
 		if err != nil {
@@ -406,17 +525,14 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("BackgroundCleanup", func(t *testing.T) {
-		// Insert expired paste
 		_, err := app.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', '-31 days'))`,
 			"tobecleaned", []byte("data"), make([]byte, ivSize))
 		if err != nil {
 			t.Fatalf("Insert failed: %v", err)
 		}
 
-		// Direct call to cover cleanup logic
 		app.runCleanup()
 
-		// Verify removed
 		var count int
 		err = app.DB.QueryRow("SELECT COUNT(*) FROM pastes WHERE id = ?", "tobecleaned").Scan(&count)
 		if err != nil || count != 0 {
@@ -425,22 +541,18 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("BackgroundVacuum", func(t *testing.T) {
-		// Direct call to cover PRAGMA incremental_vacuum path
 		app.runIncrementalVacuum()
-		// No strong assertion possible in-memory, but execution covers code/logging
 	})
 
 	t.Run("IDCollisionHandling", func(t *testing.T) {
-		// New app with tiny ID length to force collisions quickly
 		testApp, err := NewApp(":memory:")
 		if err != nil {
 			t.Fatalf("Failed to create collision test app: %v", err)
 		}
 		defer testApp.Close()
 
-		testApp.IDLength = 1 // Very small to trigger length increases
+		testApp.IDLength = 1
 
-		// Use production handler
 		testHandler := newHandler(testApp)
 		testSrv := httptest.NewServer(testHandler)
 		defer testSrv.Close()
