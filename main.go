@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/base64"
@@ -11,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -40,6 +38,7 @@ var (
 	maxSize          = flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
 	listenAddr       = flag.String("addr", "0.0.0.0", "Listen address")
 	listenPort       = flag.String("port", "8080", "Listen port")
+	version          = "devel"
 )
 
 func init() {
@@ -91,29 +90,7 @@ func NewApp(dbPath string) (*App, error) {
 		ExpDuration:     time.Duration(*expDays) * 24 * time.Hour,
 		CleanupInterval: *cleanupInterval,
 		MaxSize:         *maxSize,
-	}
-
-	exePath, err := os.Executable()
-	if err != nil {
-		slog.Warn("Failed to get executable path", "err", err)
-	} else {
-		f, err := os.Open(exePath)
-		if err != nil {
-			slog.Warn("Failed to open executable for hashing", "err", err)
-		} else {
-			defer f.Close()
-			h := sha256.New()
-			if _, err := io.Copy(h, f); err != nil {
-				slog.Warn("Failed to hash binary", "err", err)
-			} else {
-				fullHash := h.Sum(nil)
-				app.AssetVersion = base64.RawURLEncoding.EncodeToString(fullHash[:9])
-				slog.Debug("Computed asset version from binary hash", "version", app.AssetVersion)
-			}
-		}
-	}
-	if app.AssetVersion == "" {
-		app.AssetVersion = "devel"
+		AssetVersion:    version,
 	}
 
 	if err := app.initDB(); err != nil {
