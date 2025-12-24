@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -607,4 +609,95 @@ func TestAppIntegration(t *testing.T) {
 			t.Errorf("Expected max ID length > %d after collisions, got %d", testApp.IDLength, maxLen)
 		}
 	})
+}
+
+func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
+	app, err := NewApp(":memory:")
+	if err != nil {
+		t.Fatalf("Failed to create test app: %v", err)
+	}
+	defer app.Close()
+
+	handler := newHandler(app)
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	// Create one paste
+	validIV := make([]byte, ivSize)
+	if _, err := rand.Read(validIV); err != nil {
+		t.Fatalf("Failed to generate IV: %v", err)
+	}
+	b64IV := base64.StdEncoding.EncodeToString(validIV)
+
+	fakeEncData := []byte("concurrent reads test paste content")
+	b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
+
+	reqBody, err := json.Marshal(map[string]string{
+		"data": b64Data,
+		"iv":   b64IV,
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal request: %v", err)
+	}
+
+	resp, err := http.Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create paste: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected 200 when creating paste, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	var createResp struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil || createResp.ID == "" {
+		t.Fatalf("Failed to parse created paste ID: %v", err)
+	}
+	pasteID := createResp.ID
+
+	// Concurrent reads
+	const concurrency = 500 // High enough to force multiple pooled connections
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			res, err := srv.Client().Get(srv.URL + "/p/" + pasteID)
+			if err != nil {
+				failed.Add(1)
+				return
+			}
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusOK {
+				failed.Add(1)
+				return
+			}
+
+			var getResp struct {
+				Data string `json:"data"`
+				IV   string `json:"iv"`
+			}
+			if err := json.NewDecoder(res.Body).Decode(&getResp); err != nil {
+				failed.Add(1)
+				return
+			}
+
+			if getResp.Data != b64Data || getResp.IV != b64IV {
+				failed.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if failed.Load() > 0 {
+		t.Errorf("Concurrent reads failed: %d/%d requests returned wrong/missing data (expected 0 failures with shared-cache)", failed.Load(), concurrency)
+	}
 }

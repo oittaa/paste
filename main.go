@@ -75,6 +75,8 @@ func NewApp(dbPath string) (*App, error) {
 
 	if dbPath == ":memory:" {
 		slog.Info("Using in-memory DB")
+		name := randString(32)
+		dbPath = fmt.Sprintf("file:%s?mode=memory&cache=shared", name)
 	} else {
 		slog.Info("Using file DB", "path", dbPath)
 	}
