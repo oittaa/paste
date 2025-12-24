@@ -278,7 +278,8 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		IV   string `json:"iv"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		if strings.Contains(err.Error(), "request body too large") {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
 			http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
 		} else {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
