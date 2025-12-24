@@ -1,0 +1,62 @@
+name: E2E Tests
+
+on: [push, pull_request]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Build Paste binary
+        run: go build -o paste .
+
+      - name: Start Paste server (background)
+        run: |
+          ./paste -addr 0.0.0.0 -port 8080 -db :memory: &
+          echo $! > server.pid
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Install Playwright dependencies
+        working-directory: tests
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: tests
+        run: npx playwright install --with-deps
+
+      - name: Verify server is ready
+        run: |
+          curl --fail --silent --show-error --max-time 60 http://localhost:8080/health >/dev/null || \
+            (echo "Server failed to become healthy" && kill $(cat server.pid) && exit 1)
+
+      - name: Run Playwright E2E tests
+        working-directory: tests
+        run: npx playwright test
+
+      - name: Upload Playwright report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report
+          path: tests/playwright-report/
+          retention-days: 30
+
+      - name: Stop server (cleanup)
+        if: always()
+        run: |
+          kill $(cat server.pid) || true
+          rm -f server.pid
