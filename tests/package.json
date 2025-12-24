@@ -1,0 +1,20 @@
+{
+  "name": "paste-e2e",
+  "version": "1.0.0",
+  "description": "E2E tests for Pastebin app using Playwright",
+  "scripts": {
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:debug": "playwright test --headed --browser=all"
+  },
+  "keywords": ["playwright", "e2e", "testing"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@types/node": "^25.0.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

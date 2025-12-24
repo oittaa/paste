@@ -1,0 +1,38 @@
+{
+  // Recommended base for Playwright E2E tests
+  "compilerOptions": {
+    // File Layout (no outDir needed—Playwright doesn't compile)
+    "rootDir": ".",
+
+    // Module & Target (Playwright works best with modern Node/CommonJS)
+    "module": "commonjs",              // Matches your package.json "type": "commonjs"
+    "target": "es2024",                // Modern but compatible (esnext is fine too)
+    "moduleResolution": "node",        // Standard for Node-based tools
+
+    // Environment (DOM for browser APIs, Node types since you have @types/node)
+    "lib": ["dom", "dom.iterable", "es2022"],
+    "types": ["node"],                 // Explicitly include Node types (you have @types/node installed)
+
+    // Type Checking
+    "strict": true,                    // Keep this—great for catching errors
+    "noUncheckedIndexedAccess": true,  // Good stricter option you already have
+    "exactOptionalPropertyTypes": true,// Another good stricter option
+    "skipLibCheck": true,              // Keeps things fast
+
+    // Interop & Imports
+    "esModuleInterop": true,           // Essential for CommonJS/TS interop
+    "resolveJsonModule": true,         // Useful if importing JSON (e.g., config files)
+    "allowSyntheticDefaultImports": true, // Helps with some imports
+
+    // Playwright-specific (ensures compatibility with test runner)
+    "isolatedModules": true,           // Required for some transpilers
+    "noEmit": true,                    // Playwright doesn't need emitted JS
+
+    // Optional extras (uncomment if you want even stricter checks)
+    // "noUnusedLocals": true,
+    // "noUnusedParameters": true,
+    // "noImplicitReturns": true
+  },
+  "include": ["**/*.ts", "playwright.config.ts"],  // Explicitly include test files + config
+  "exclude": ["node_modules", "dist", "playwright-report"]
+}

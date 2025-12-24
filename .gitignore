@@ -1,0 +1,44 @@
+# Go build artifacts and caches
+paste
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go module caches and temp files
+/go.pkg.mod
+/go.sum.tmp
+
+# Dependency directories (Go)
+vendor/
+
+# Node.js / Playwright
+tests/node_modules/
+tests/playwright-report/
+tests/test-results/
+tests/.cache/
+tests/.playwright/
+
+# Playwright browsers (large, downloaded in CI/local)
+.playwright/
+
+# General dev artifacts
+.DS_Store
+*.log
+*.tmp
+*.bak
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Coverage and profiling
+coverage.txt
+*.out
+*.prof
+
+# Optional: ignore local env files
+.env
+.env.local
