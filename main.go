@@ -31,13 +31,6 @@ var (
 	ErrPasteNotFound = errors.New("paste not found")
 	ErrPasteExpired  = errors.New("paste expired")
 	validChars       [128]bool
-	dbFile           = flag.String("db", "pastes.db", "SQLite DB file (use ':memory:' for in-mem)")
-	idLength         = flag.Int("idlen", 8, "Default paste ID length")
-	expDays          = flag.Int("expdays", 30, "Paste expiration days")
-	cleanupInterval  = flag.Duration("cleanup-interval", time.Hour, "Cleanup interval")
-	maxSize          = flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
-	listenAddr       = flag.String("addr", "0.0.0.0", "Listen address")
-	listenPort       = flag.String("port", "8080", "Listen port")
 	version          = "devel"
 )
 
@@ -67,12 +60,21 @@ type App struct {
 	AssetVersion    string
 }
 
-func NewApp(dbPath string) (*App, error) {
+type AppConfig struct {
+	DBFile          string
+	IDLength        int
+	ExpDuration     time.Duration
+	CleanupInterval time.Duration
+	MaxSize         int64
+}
+
+func NewApp(cfg AppConfig) (*App, error) {
 	tmpl, err := template.ParseFS(content, "templates/index.html")
 	if err != nil {
 		return nil, err
 	}
 
+	dbPath := cfg.DBFile
 	if dbPath == ":memory:" {
 		slog.Info("Using in-memory DB")
 		name := randString(32)
@@ -80,6 +82,7 @@ func NewApp(dbPath string) (*App, error) {
 	} else {
 		slog.Info("Using file DB", "path", dbPath)
 	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
@@ -88,10 +91,10 @@ func NewApp(dbPath string) (*App, error) {
 	app := &App{
 		DB:              db,
 		Tmpl:            tmpl,
-		IDLength:        *idLength,
-		ExpDuration:     time.Duration(*expDays) * 24 * time.Hour,
-		CleanupInterval: *cleanupInterval,
-		MaxSize:         *maxSize,
+		IDLength:        cfg.IDLength,
+		ExpDuration:     cfg.ExpDuration,
+		CleanupInterval: cfg.CleanupInterval,
+		MaxSize:         cfg.MaxSize,
 		AssetVersion:    version,
 	}
 
@@ -168,8 +171,12 @@ func (a *App) runCleanup() {
 	}
 	defer tx.Rollback()
 
-	hours := int(a.ExpDuration.Hours())
-	modifier := fmt.Sprintf("-%d hours", hours)
+	seconds := int(a.ExpDuration / time.Second)
+	if seconds <= 0 {
+		slog.Warn("Expiration duration is zero or negative – skipping cleanup", "duration", a.ExpDuration)
+		return
+	}
+	modifier := fmt.Sprintf("-%d seconds", seconds)
 	res, err := tx.Exec("DELETE FROM pastes WHERE created < datetime('now', ?)", modifier)
 	if err != nil {
 		slog.Error("Cleanup delete error", "err", err)
@@ -195,8 +202,10 @@ func (a *App) cleanupGoroutine() {
 	}
 }
 
-func (a *App) Close() error {
-	return a.DB.Close()
+func (a *App) Close() {
+	if err := a.DB.Close(); err != nil {
+		slog.Error("Failed to close database", "err", err)
+	}
 }
 
 // SecurityHeadersMiddleware adds CSP and other hardening headers
@@ -383,7 +392,7 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 	ivB64 := base64.StdEncoding.EncodeToString(content.IV)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", secondsUntilExpiry))
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]string{
 		"data": dataB64,
 		"iv":   ivB64,
 	})
@@ -448,25 +457,46 @@ func newHandler(app *App) http.Handler {
 	return SecurityHeadersMiddleware(mux)
 }
 
-func main() {
+func run() error {
+	// Flags are defined here – they are registered once when run() is called (which happens exactly once).
+	dbFile := flag.String("db", "pastes.db", "SQLite DB file (use ':memory:' for in-mem)")
+	idLength := flag.Int("idlen", 8, "Default paste ID length")
+	expireDuration := flag.Duration("expire-duration", 30*24*time.Hour, "Paste expiration duration (e.g. 720h for 30 days)")
+	cleanupInterval := flag.Duration("cleanup-interval", time.Hour, "Database cleanup interval")
+	maxSize := flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
+	listenAddr := flag.String("addr", "0.0.0.0", "Listen address")
+	listenPort := flag.String("port", "8080", "Listen port")
+
 	flag.Parse()
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
-	app, err := NewApp(*dbFile)
+	cfg := AppConfig{
+		DBFile:          *dbFile,
+		IDLength:        *idLength,
+		ExpDuration:     *expireDuration,
+		CleanupInterval: *cleanupInterval,
+		MaxSize:         *maxSize,
+	}
+
+	app, err := NewApp(cfg)
 	if err != nil {
-		slog.Error("Failed to initialize app", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to initialize app: %w", err)
 	}
 	defer app.Close()
 
 	app.StartBackgroundTasks()
 
 	addr := *listenAddr + ":" + *listenPort
-	slog.Info("Server listening", "addr", addr)
-	if err := http.ListenAndServe(addr, newHandler(app)); err != nil {
+	slog.Info("Starting server", "version", version, "addr", addr)
+
+	return http.ListenAndServe(addr, newHandler(app))
+}
+
+func main() {
+	if err := run(); err != nil {
 		slog.Error("Server failed", "err", err)
 		os.Exit(1)
 	}
