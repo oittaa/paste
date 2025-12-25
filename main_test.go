@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func assertSecurityHeaders(t *testing.T, res *http.Response) {
@@ -37,7 +38,14 @@ func assertSecurityHeaders(t *testing.T, res *http.Response) {
 
 func TestAppIntegration(t *testing.T) {
 	// Create in-memory app for isolated testing
-	app, err := NewApp(":memory:")
+	cfg := AppConfig{
+		DBFile:          ":memory:",
+		IDLength:        8,
+		ExpDuration:     30 * 24 * time.Hour,
+		CleanupInterval: time.Hour,
+		MaxSize:         1 << 20,
+	}
+	app, err := NewApp(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create test app: %v", err)
 	}
@@ -547,13 +555,18 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("IDCollisionHandling", func(t *testing.T) {
-		testApp, err := NewApp(":memory:")
+		cfg := AppConfig{
+			DBFile:          ":memory:",
+			IDLength:        1,
+			ExpDuration:     30 * 24 * time.Hour,
+			CleanupInterval: time.Hour,
+			MaxSize:         1 << 20,
+		}
+		testApp, err := NewApp(cfg)
 		if err != nil {
 			t.Fatalf("Failed to create collision test app: %v", err)
 		}
 		defer testApp.Close()
-
-		testApp.IDLength = 1
 
 		testHandler := newHandler(testApp)
 		testSrv := httptest.NewServer(testHandler)
@@ -570,7 +583,7 @@ func TestAppIntegration(t *testing.T) {
 
 		reqBody, _ := json.Marshal(map[string]string{"data": dummyB64, "iv": dummyB64IV})
 
-		for i := 0; i < numInserts; i++ {
+		for i := range numInserts {
 			res, err := testSrv.Client().Post(testSrv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
 			if err != nil {
 				t.Fatalf("POST %d failed: %v", i+1, err)
@@ -612,7 +625,14 @@ func TestAppIntegration(t *testing.T) {
 }
 
 func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
-	app, err := NewApp(":memory:")
+	cfg := AppConfig{
+		DBFile:          ":memory:",
+		IDLength:        8,
+		ExpDuration:     30 * 24 * time.Hour,
+		CleanupInterval: time.Hour,
+		MaxSize:         1 << 20,
+	}
+	app, err := NewApp(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create test app: %v", err)
 	}
@@ -663,10 +683,8 @@ func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
 	var wg sync.WaitGroup
 	var failed atomic.Int32
 
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range concurrency {
+		wg.Go(func() {
 
 			res, err := srv.Client().Get(srv.URL + "/p/" + pasteID)
 			if err != nil {
@@ -692,7 +710,7 @@ func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
 			if getResp.Data != b64Data || getResp.IV != b64IV {
 				failed.Add(1)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
