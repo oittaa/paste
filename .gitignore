@@ -1,5 +1,6 @@
 # Go build artifacts and caches
 paste
+pastes.db*
 *.exe
 *.exe~
 *.dll
