@@ -28,9 +28,9 @@ function enterViewMode() {
     code.className = 'hljs';
     delete code.dataset.highlighted;
     code.textContent = output.value;
-    if (typeof hljs !== 'undefined' && typeof hljs.highlightElement === 'function') {
+    if (typeof window.hljs !== 'undefined' && typeof window.hljs.highlightElement === 'function') {
         try {
-            hljs.highlightElement(code);
+            window.hljs.highlightElement(code);
         } catch (e) {
             console.warn('Highlight.js highlighting failed:', e);
         }
@@ -213,6 +213,7 @@ async function loadPaste() {
         respData = await res.json();
     } catch (e) {
         showStatus('Network error loading paste.', 'error');
+        console.error('Network error:', e);
         return false;
     }
 
@@ -230,8 +231,7 @@ async function loadPaste() {
 }
 
 async function handleLocation() {
-    currentSequence = ++currentSequence % (10 ** 9 + 7);
-    const thisSequence = currentSequence;
+    const thisSequence = currentSequence = (currentSequence + 1) % (10 ** 9 + 7);
     const loaded = await loadPaste();
     if (thisSequence !== currentSequence) {
         return;
