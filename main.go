@@ -427,14 +427,9 @@ func randString(length int) string {
 	rand.Read(b)
 	for i := range b {
 		rb := int(b[i])
-		if rb > maxAccept {
-			for {
-				rand.Read(b[i : i+1])
-				rb = int(b[i])
-				if rb <= maxAccept {
-					break
-				}
-			}
+		for rb > maxAccept {
+			rand.Read(b[i : i+1])
+			rb = int(b[i])
 		}
 		b[i] = charset[rb%charsetLen]
 	}
