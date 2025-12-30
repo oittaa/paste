@@ -27,13 +27,10 @@ jobs:
       - name: Run gosec with SARIF output
         uses: securego/gosec@v2.22.11
         with:
-          args: >-
-            -fmt=sarif
-            -out=results.sarif
-            ./...
+          # we let the report trigger content trigger a failure using the GitHub Security features.
+          args: '-no-fail -fmt sarif -out results.sarif ./...'
 
       - name: Upload SARIF to GitHub Code Scanning
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
-        if: always()
