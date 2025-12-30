@@ -1,0 +1,39 @@
+name: Security Scan
+
+on:
+  push:
+    branches:
+    - master
+  pull_request:
+    branches:
+    - master
+
+permissions:
+  contents: read
+  security-events: write  # Required for SARIF upload to Code Scanning
+
+jobs:
+  gosec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Run gosec with SARIF output
+        uses: securego/gosec@v2.22.11
+        with:
+          args: >-
+            -fmt=sarif
+            -out=results.sarif
+            ./...
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+        if: always()

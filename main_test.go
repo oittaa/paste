@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +36,12 @@ func assertSecurityHeaders(t *testing.T, res *http.Response) {
 	if got := res.Header.Get("Referrer-Policy"); got != "no-referrer" {
 		t.Errorf("Referrer-Policy mismatch: got %q", got)
 	}
+}
+
+func TestMain(m *testing.M) {
+	// Completely silence all logging during tests
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	os.Exit(m.Run())
 }
 
 func TestAppIntegration(t *testing.T) {

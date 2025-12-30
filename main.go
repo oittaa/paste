@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -135,6 +136,11 @@ func (a *App) initDB() error {
 	if err != nil {
 		slog.Warn("Failed to enable incremental auto_vacuum", "err", err)
 	}
+	var count int64
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM pastes").Scan(&count); err != nil {
+		return fmt.Errorf("database initialization failed: unable to verify paste count: %w", err)
+	}
+	slog.Info("database ready", "paste_count", count)
 	return nil
 }
 
@@ -188,7 +194,7 @@ func (a *App) runCleanup() {
 		return
 	}
 	if rows > 0 {
-		slog.Info("Cleaned up expired pastes", "count", rows)
+		slog.Info("Cleaned up expired pastes", "deleted", rows)
 	}
 }
 
@@ -270,6 +276,7 @@ func (a *App) serveHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
+		// #nosec G104 -- write errors on disconnected clients are expected/no-op
 		w.Write([]byte("ok"))
 	}
 }
@@ -289,8 +296,10 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
+			slog.Warn("create request too large", "remote_addr", clientIP(r))
 			http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
 		} else {
+			slog.Warn("invalid create request", "err", err, "remote_addr", clientIP(r))
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		}
 		return
@@ -323,8 +332,10 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
+	slog.Info("paste created", "id", id, "size_bytes", len(decodedData), "remote_addr", clientIP(r))
 
 	w.Header().Set("Content-Type", "application/json")
+	// #nosec G104 -- write errors on disconnected clients are expected/no-op
 	json.NewEncoder(w).Encode(map[string]string{"id": id})
 }
 
@@ -351,6 +362,7 @@ func (a *App) InsertPaste(data, iv []byte) (string, error) {
 		}
 		if retries%10 == 0 {
 			length++
+			slog.Info("id collision threshold reached", "new_length", length, "retries", retries)
 		}
 	}
 }
@@ -392,6 +404,7 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 	ivB64 := base64.StdEncoding.EncodeToString(content.IV)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", secondsUntilExpiry))
+	// #nosec G104 -- write errors on disconnected clients are expected/no-op
 	json.NewEncoder(w).Encode(map[string]string{
 		"data": dataB64,
 		"iv":   ivB64,
@@ -424,16 +437,33 @@ func (a *App) LoadPaste(id string) (*PasteContent, error) {
 
 func randString(length int) string {
 	b := make([]byte, length)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	for i := range b {
 		rb := int(b[i])
 		for rb > maxAccept {
-			rand.Read(b[i : i+1])
+			_, _ = rand.Read(b[i : i+1])
 			rb = int(b[i])
 		}
 		b[i] = charset[rb%charsetLen]
 	}
 	return string(b)
+}
+
+func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		parts := strings.Split(fwd, ",")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func newHandler(app *App) http.Handler {
@@ -461,12 +491,39 @@ func run() error {
 	maxSize := flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
 	listenAddr := flag.String("addr", "0.0.0.0", "Listen address")
 	listenPort := flag.String("port", "8080", "Listen port")
+	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	logFormat := flag.String("log-format", "", "Log format: text (default) or json")
 
 	flag.Parse()
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
+	var level slog.Level
+	switch strings.ToLower(*logLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return fmt.Errorf("invalid log level: %s", *logLevel)
+	}
+
+	var handler slog.Handler
+	opts := &slog.HandlerOptions{Level: level}
+
+	format := strings.ToLower(*logFormat)
+	if format == "" {
+		format = strings.ToLower(os.Getenv("LOG_FORMAT"))
+	}
+
+	if format == "json" {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+	slog.SetDefault(slog.New(handler))
 
 	cfg := AppConfig{
 		DBFile:          *dbFile,
@@ -485,9 +542,21 @@ func run() error {
 	app.StartBackgroundTasks()
 
 	addr := *listenAddr + ":" + *listenPort
-	slog.Info("Starting server", "version", version, "addr", addr)
 
-	return http.ListenAndServe(addr, newHandler(app))
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      newHandler(app),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	slog.Info("Starting server", "version", version, "addr", addr, "log_level", level)
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("server error: %w", err)
+	}
+	return nil
 }
 
 func main() {
