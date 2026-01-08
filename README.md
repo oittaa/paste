@@ -1,5 +1,7 @@
 # Paste
 
+![Paste UI](screenshot.png)
+
 A simple, fast, and secure pastebin application written in Go.
 
 ## Features
