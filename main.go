@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"embed"
@@ -14,8 +15,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -144,19 +147,28 @@ func (a *App) initDB() error {
 	return nil
 }
 
-func (a *App) StartBackgroundTasks() {
-	go a.incrementalVacuumGoroutine()
-	go a.cleanupGoroutine()
+func (a *App) StartBackgroundTasks(ctx context.Context) {
+	go a.incrementalVacuumGoroutine(ctx)
+	go a.cleanupGoroutine(ctx)
 }
 
-func (a *App) incrementalVacuumGoroutine() {
-	time.Sleep(30 * time.Second)
-	a.runIncrementalVacuum()
+func (a *App) incrementalVacuumGoroutine(ctx context.Context) {
+	select {
+	case <-time.After(30 * time.Second):
+		a.runIncrementalVacuum()
+	case <-ctx.Done():
+		return
+	}
 
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
-	for range ticker.C {
-		a.runIncrementalVacuum()
+	for {
+		select {
+		case <-ticker.C:
+			a.runIncrementalVacuum()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -175,7 +187,11 @@ func (a *App) runCleanup() {
 		slog.Error("Cleanup tx begin error", "err", err)
 		return
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			slog.Error("Cleanup rollback error", "err", err)
+		}
+	}()
 
 	seconds := int(a.ExpDuration / time.Second)
 	if seconds <= 0 {
@@ -198,13 +214,18 @@ func (a *App) runCleanup() {
 	}
 }
 
-func (a *App) cleanupGoroutine() {
+func (a *App) cleanupGoroutine(ctx context.Context) {
 	a.runCleanup()
 
 	ticker := time.NewTicker(a.CleanupInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		a.runCleanup()
+	for {
+		select {
+		case <-ticker.C:
+			a.runCleanup()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -276,8 +297,7 @@ func (a *App) serveHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
-		// #nosec G104 -- write errors on disconnected clients are expected/no-op
-		w.Write([]byte("ok"))
+		sendText(w, "ok")
 	}
 }
 
@@ -334,9 +354,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("paste created", "id", id, "size_bytes", len(decodedData), "remote_addr", clientIP(r))
 
-	w.Header().Set("Content-Type", "application/json")
-	// #nosec G104 -- write errors on disconnected clients are expected/no-op
-	json.NewEncoder(w).Encode(map[string]string{"id": id})
+	sendJSON(w, map[string]string{"id": id})
 }
 
 func (a *App) InsertPaste(data, iv []byte) (string, error) {
@@ -402,10 +420,8 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 
 	dataB64 := base64.StdEncoding.EncodeToString(content.Data)
 	ivB64 := base64.StdEncoding.EncodeToString(content.IV)
-	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", secondsUntilExpiry))
-	// #nosec G104 -- write errors on disconnected clients are expected/no-op
-	json.NewEncoder(w).Encode(map[string]string{
+	sendJSON(w, map[string]string{
 		"data": dataB64,
 		"iv":   ivB64,
 	})
@@ -466,6 +482,19 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+func sendJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Debug("JSON encode error", "err", err)
+	}
+}
+
+func sendText(w http.ResponseWriter, s string) {
+	if _, err := w.Write([]byte(s)); err != nil {
+		slog.Debug("Text write error", "err", err)
+	}
+}
+
 func newHandler(app *App) http.Handler {
 	mux := http.NewServeMux()
 
@@ -483,7 +512,51 @@ func newHandler(app *App) http.Handler {
 }
 
 func run() error {
-	// Flags are defined here – they are registered once when run() is called (which happens exactly once).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, logLevel, logFormat := parseFlags()
+	setupLogging(logLevel, logFormat)
+
+	app, err := NewApp(cfg.AppConfig)
+	if err != nil {
+		return fmt.Errorf("failed to initialize app: %w", err)
+	}
+	defer app.Close()
+
+	app.StartBackgroundTasks(ctx)
+
+	srv := &http.Server{
+		Addr:         cfg.ListenAddr,
+		Handler:      newHandler(app),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+		BaseContext:  func(_ net.Listener) context.Context { return ctx },
+	}
+
+	go func() {
+		slog.Info("Starting server", "version", version, "addr", cfg.ListenAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("ListenAndServe failed", "err", err)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("Shutting down gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	return srv.Shutdown(shutdownCtx)
+}
+
+type ExtendedConfig struct {
+	AppConfig
+	ListenAddr string
+}
+
+func parseFlags() (ExtendedConfig, string, string) {
 	dbFile := flag.String("db", "pastes.db", "SQLite DB file (use ':memory:' for in-mem)")
 	idLength := flag.Int("idlen", 8, "Default paste ID length")
 	expireDuration := flag.Duration("expire-duration", 30*24*time.Hour, "Paste expiration duration (e.g. 720h for 30 days)")
@@ -491,72 +564,42 @@ func run() error {
 	maxSize := flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
 	listenAddr := flag.String("addr", "0.0.0.0", "Listen address")
 	listenPort := flag.String("port", "8080", "Listen port")
-	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
-	logFormat := flag.String("log-format", "", "Log format: text (default) or json")
+	logLevel := flag.String("log-level", "info", "Log level")
+	logFormat := flag.String("log-format", "", "Log format: text or json")
 
 	flag.Parse()
 
+	return ExtendedConfig{
+		AppConfig: AppConfig{
+			DBFile:          *dbFile,
+			IDLength:        *idLength,
+			ExpDuration:     *expireDuration,
+			CleanupInterval: *cleanupInterval,
+			MaxSize:         *maxSize,
+		},
+		ListenAddr: *listenAddr + ":" + *listenPort,
+	}, *logLevel, *logFormat
+}
+
+func setupLogging(levelStr, formatStr string) {
 	var level slog.Level
-	switch strings.ToLower(*logLevel) {
-	case "debug":
-		level = slog.LevelDebug
-	case "info":
+	if err := level.UnmarshalText([]byte(levelStr)); err != nil {
 		level = slog.LevelInfo
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		return fmt.Errorf("invalid log level: %s", *logLevel)
 	}
 
-	var handler slog.Handler
 	opts := &slog.HandlerOptions{Level: level}
-
-	format := strings.ToLower(*logFormat)
+	format := strings.ToLower(formatStr)
 	if format == "" {
 		format = strings.ToLower(os.Getenv("LOG_FORMAT"))
 	}
 
+	var handler slog.Handler
 	if format == "json" {
 		handler = slog.NewJSONHandler(os.Stdout, opts)
 	} else {
 		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 	slog.SetDefault(slog.New(handler))
-
-	cfg := AppConfig{
-		DBFile:          *dbFile,
-		IDLength:        *idLength,
-		ExpDuration:     *expireDuration,
-		CleanupInterval: *cleanupInterval,
-		MaxSize:         *maxSize,
-	}
-
-	app, err := NewApp(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to initialize app: %w", err)
-	}
-	defer app.Close()
-
-	app.StartBackgroundTasks()
-
-	addr := *listenAddr + ":" + *listenPort
-
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      newHandler(app),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	slog.Info("Starting server", "version", version, "addr", addr, "log_level", level)
-
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("server error: %w", err)
-	}
-	return nil
 }
 
 func main() {

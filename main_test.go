@@ -69,7 +69,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to GET /health: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusOK {
 			t.Errorf("Expected status 200 for /health, got %d", res.StatusCode)
 		}
@@ -88,7 +88,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to HEAD /health: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusOK {
 			t.Errorf("Expected status 200 for HEAD /health, got %d", res.StatusCode)
 		}
@@ -107,7 +107,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to POST /health: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusMethodNotAllowed {
 			t.Errorf("Expected 405 for POST /health, got %d", res.StatusCode)
 		}
@@ -120,7 +120,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to GET /: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusOK {
 			t.Errorf("Expected status 200, got %d", res.StatusCode)
 		}
@@ -145,7 +145,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to HEAD /: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusOK {
 			t.Errorf("Expected 200 for HEAD /, got %d", res.StatusCode)
 		}
@@ -167,7 +167,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to POST /: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusMethodNotAllowed {
 			t.Errorf("Expected 405 for POST /, got %d", res.StatusCode)
 		}
@@ -178,7 +178,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to GET /invalid: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status 404 for invalid path, got %d", res.StatusCode)
 		}
@@ -192,7 +192,7 @@ func TestAppIntegration(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to GET %s: %v", path, err)
 				}
-				defer res.Body.Close()
+				t.Cleanup(func() { _ = res.Body.Close() })
 				if res.StatusCode != http.StatusOK {
 					t.Errorf("Expected 200 for %s, got %d", path, res.StatusCode)
 				}
@@ -227,7 +227,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST /paste: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 
 			bodyBytes, _ := io.ReadAll(res.Body)
 			if res.StatusCode != http.StatusOK {
@@ -254,7 +254,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST invalid JSON: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusBadRequest {
 				t.Errorf("Expected 400 for invalid JSON, got %d", res.StatusCode)
 			}
@@ -272,7 +272,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST huge request: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusRequestEntityTooLarge {
 				t.Errorf("Expected 413 Request too large (MaxBytesReader), got %d", res.StatusCode)
 			}
@@ -289,7 +289,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST invalid base64: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusBadRequest {
 				t.Errorf("Expected 400 for invalid base64 data, got %d", res.StatusCode)
 			}
@@ -308,7 +308,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST oversized: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusRequestEntityTooLarge {
 				t.Errorf("Expected 413 for oversized decoded data, got %d", res.StatusCode)
 			}
@@ -330,7 +330,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST invalid IV: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusBadRequest {
 				t.Errorf("Expected 400 for invalid IV length, got %d", res.StatusCode)
 			}
@@ -342,7 +342,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to GET /paste: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusMethodNotAllowed {
 				t.Errorf("Expected 405 for non-POST, got %d", res.StatusCode)
 			}
@@ -365,7 +365,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create paste for PasteHandler tests: %v", err)
 		}
-		defer createRes.Body.Close()
+		t.Cleanup(func() { _ = createRes.Body.Close() })
 
 		if createRes.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to create paste: expected 200, got %d", createRes.StatusCode)
@@ -397,7 +397,7 @@ func TestAppIntegration(t *testing.T) {
 					if err != nil {
 						t.Fatalf("Failed to GET /p/%s: %v", id, err)
 					}
-					defer res.Body.Close()
+					t.Cleanup(func() { _ = res.Body.Close() })
 
 					if res.StatusCode != http.StatusOK {
 						t.Errorf("Expected 200, got %d", res.StatusCode)
@@ -439,7 +439,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to HEAD /p/%s: %v", id, err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusOK {
 				t.Errorf("Expected 200 for HEAD, got %d", res.StatusCode)
 			}
@@ -458,7 +458,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to GET nonexistent: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusNotFound {
 				t.Errorf("Expected 404 for nonexistent, got %d", res.StatusCode)
 			}
@@ -470,7 +470,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to GET invalid chars: %v", err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusNotFound {
 				t.Errorf("Expected 404 for invalid chars, got %d", res.StatusCode)
 			}
@@ -483,7 +483,7 @@ func TestAppIntegration(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to GET %s: %v", path, err)
 				}
-				defer res.Body.Close()
+				t.Cleanup(func() { _ = res.Body.Close() })
 				if res.StatusCode != http.StatusNotFound {
 					t.Errorf("Expected 404 for %s, got %d", path, res.StatusCode)
 				}
@@ -500,7 +500,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to POST /p/%s: %v", id, err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 			if res.StatusCode != http.StatusMethodNotAllowed {
 				t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
 			}
@@ -519,7 +519,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to GET expired: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusGone {
 			t.Errorf("Expected 410 Gone for expired paste, got %d", res.StatusCode)
 		}
@@ -535,7 +535,7 @@ func TestAppIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to GET fresh: %v", err)
 		}
-		defer res.Body.Close()
+		t.Cleanup(func() { _ = res.Body.Close() })
 		if res.StatusCode != http.StatusOK {
 			t.Errorf("Expected 200 for fresh paste, got %d", res.StatusCode)
 		}
@@ -586,7 +586,7 @@ func TestAppIntegration(t *testing.T) {
 		dummyData := []byte("dummy")
 		dummyB64 := base64.StdEncoding.EncodeToString(dummyData)
 		dummyIV := make([]byte, ivSize)
-		rand.Read(dummyIV)
+		_, _ = rand.Read(dummyIV)
 		dummyB64IV := base64.StdEncoding.EncodeToString(dummyIV)
 
 		reqBody, _ := json.Marshal(map[string]string{"data": dummyB64, "iv": dummyB64IV})
@@ -596,7 +596,7 @@ func TestAppIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("POST %d failed: %v", i+1, err)
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 
 			bodyBytes, _ := io.ReadAll(res.Body)
 			if res.StatusCode != http.StatusOK {
@@ -672,7 +672,7 @@ func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create paste: %v", err)
 	}
-	defer resp.Body.Close()
+	t.Cleanup(func() { _ = resp.Body.Close() })
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("Expected 200 when creating paste, got %d: %s", resp.StatusCode, string(body))
@@ -699,7 +699,7 @@ func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
 				failed.Add(1)
 				return
 			}
-			defer res.Body.Close()
+			t.Cleanup(func() { _ = res.Body.Close() })
 
 			if res.StatusCode != http.StatusOK {
 				failed.Add(1)
