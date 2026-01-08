@@ -1,0 +1,25 @@
+# Version control and CI
+.git
+.github
+
+# Development dependencies and artifacts
+node_modules
+playwright-report
+test-results
+.cache
+.playwright
+
+# Build artifacts and databases
+paste
+*.db
+*.pid
+data
+
+# Coverage files
+coverage.txt
+*.out
+
+# IDE files
+.idea
+.vscode
+.DS_Store

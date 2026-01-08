@@ -1,0 +1,20 @@
+FROM mcr.microsoft.com/playwright:v1.57.0-noble
+
+# Install base Go - go.mod will trigger download of the specific version
+RUN apt-get update && apt-get install -y golang && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy package files first for caching
+COPY package*.json ./
+RUN npm ci
+
+# Copy the rest of the source
+COPY . .
+
+# Install Playwright browsers (and any missing system deps)
+RUN npx playwright install --with-deps
+
+# Run Playwright tests
+# The webServer in playwright.config.ts will handle starting the Go server
+CMD ["npx", "playwright", "test"]
