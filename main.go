@@ -64,15 +64,18 @@ type App struct {
 	AssetVersion    string
 }
 
-type AppConfig struct {
+type Config struct {
 	DBFile          string
 	IDLength        int
 	ExpDuration     time.Duration
 	CleanupInterval time.Duration
 	MaxSize         int64
+	ListenAddr      string
+	LogLevel        string
+	LogFormat       string
 }
 
-func NewApp(cfg AppConfig) (*App, error) {
+func NewApp(cfg *Config) (*App, error) {
 	tmpl, err := template.ParseFS(content, "templates/index.html")
 	if err != nil {
 		return nil, err
@@ -307,6 +310,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit request size to paste MaxSize + approx base64/JSON overhead (3/2 factor)
 	r.Body = http.MaxBytesReader(w, r.Body, a.MaxSize*3/2+8192)
 
 	var req struct {
@@ -515,10 +519,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, logLevel, logFormat := parseFlags()
-	setupLogging(logLevel, logFormat)
+	cfg := parseFlags()
+	setupLogging(cfg)
 
-	app, err := NewApp(cfg.AppConfig)
+	app, err := NewApp(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize app: %w", err)
 	}
@@ -551,12 +555,7 @@ func run() error {
 	return srv.Shutdown(shutdownCtx)
 }
 
-type ExtendedConfig struct {
-	AppConfig
-	ListenAddr string
-}
-
-func parseFlags() (ExtendedConfig, string, string) {
+func parseFlags() *Config {
 	dbFile := flag.String("db", "pastes.db", "SQLite DB file (use ':memory:' for in-mem)")
 	idLength := flag.Int("idlen", 8, "Default paste ID length")
 	expireDuration := flag.Duration("expire-duration", 30*24*time.Hour, "Paste expiration duration (e.g. 720h for 30 days)")
@@ -569,26 +568,26 @@ func parseFlags() (ExtendedConfig, string, string) {
 
 	flag.Parse()
 
-	return ExtendedConfig{
-		AppConfig: AppConfig{
-			DBFile:          *dbFile,
-			IDLength:        *idLength,
-			ExpDuration:     *expireDuration,
-			CleanupInterval: *cleanupInterval,
-			MaxSize:         *maxSize,
-		},
-		ListenAddr: *listenAddr + ":" + *listenPort,
-	}, *logLevel, *logFormat
+	return &Config{
+		DBFile:          *dbFile,
+		IDLength:        *idLength,
+		ExpDuration:     *expireDuration,
+		CleanupInterval: *cleanupInterval,
+		MaxSize:         *maxSize,
+		ListenAddr:      *listenAddr + ":" + *listenPort,
+		LogLevel:        *logLevel,
+		LogFormat:       *logFormat,
+	}
 }
 
-func setupLogging(levelStr, formatStr string) {
+func setupLogging(cfg *Config) {
 	var level slog.Level
-	if err := level.UnmarshalText([]byte(levelStr)); err != nil {
+	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		level = slog.LevelInfo
 	}
 
 	opts := &slog.HandlerOptions{Level: level}
-	format := strings.ToLower(formatStr)
+	format := strings.ToLower(cfg.LogFormat)
 	if format == "" {
 		format = strings.ToLower(os.Getenv("LOG_FORMAT"))
 	}

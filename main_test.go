@@ -46,14 +46,14 @@ func TestMain(m *testing.M) {
 
 func TestAppIntegration(t *testing.T) {
 	// Create in-memory app for isolated testing
-	cfg := AppConfig{
+	cfg := Config{
 		DBFile:          ":memory:",
 		IDLength:        8,
 		ExpDuration:     30 * 24 * time.Hour,
 		CleanupInterval: time.Hour,
 		MaxSize:         1 << 20,
 	}
-	app, err := NewApp(cfg)
+	app, err := NewApp(&cfg)
 	if err != nil {
 		t.Fatalf("Failed to create test app: %v", err)
 	}
@@ -563,14 +563,14 @@ func TestAppIntegration(t *testing.T) {
 	})
 
 	t.Run("IDCollisionHandling", func(t *testing.T) {
-		cfg := AppConfig{
+		cfg := Config{
 			DBFile:          ":memory:",
 			IDLength:        1,
 			ExpDuration:     30 * 24 * time.Hour,
 			CleanupInterval: time.Hour,
 			MaxSize:         1 << 20,
 		}
-		testApp, err := NewApp(cfg)
+		testApp, err := NewApp(&cfg)
 		if err != nil {
 			t.Fatalf("Failed to create collision test app: %v", err)
 		}
@@ -633,14 +633,14 @@ func TestAppIntegration(t *testing.T) {
 }
 
 func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
-	cfg := AppConfig{
+	cfg := Config{
 		DBFile:          ":memory:",
 		IDLength:        8,
 		ExpDuration:     30 * 24 * time.Hour,
 		CleanupInterval: time.Hour,
 		MaxSize:         1 << 20,
 	}
-	app, err := NewApp(cfg)
+	app, err := NewApp(&cfg)
 	if err != nil {
 		t.Fatalf("Failed to create test app: %v", err)
 	}
@@ -668,7 +668,7 @@ func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
 		t.Fatalf("Failed to marshal request: %v", err)
 	}
 
-	resp, err := http.Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
+	resp, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		t.Fatalf("Failed to create paste: %v", err)
 	}
@@ -699,8 +699,7 @@ func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
 				failed.Add(1)
 				return
 			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-
+			defer func() { _ = res.Body.Close() }()
 			if res.StatusCode != http.StatusOK {
 				failed.Add(1)
 				return
