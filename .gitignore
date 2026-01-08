@@ -14,16 +14,14 @@ pastes.db*
 
 # Dependency directories (Go)
 vendor/
+data/
 
 # Node.js / Playwright
-tests/node_modules/
-tests/playwright-report/
-tests/test-results/
-tests/.cache/
-tests/.playwright/
-
-# Playwright browsers (large, downloaded in CI/local)
-.playwright/
+node_modules
+playwright-report
+test-results
+.cache
+.playwright
 
 # General dev artifacts
 .DS_Store
