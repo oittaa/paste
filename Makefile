@@ -5,8 +5,11 @@ GO_FILES := $(shell find . -name '*.go' -not -path "./vendor/*")
 help: ## Display this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
+VERSION := $(shell date +%s)
+LDFLAGS := -ldflags "-X main.version=$(VERSION)"
+
 build: ## Build the binary
-	go build -o paste .
+	go build $(LDFLAGS) -o paste .
 
 test: ## Run unit tests with race detector
 	go test -v -race ./...
