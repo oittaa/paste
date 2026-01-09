@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -25,24 +24,14 @@ import (
 )
 
 const (
-	charset    = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	charsetLen = len(charset)
-	maxAccept  = 255 - (256 % charsetLen)
-	ivSize     = 12 // AES-GCM IV size in bytes
+	ivSize = 12 // AES-GCM IV size in bytes
 )
 
 var (
 	ErrPasteNotFound = errors.New("paste not found")
 	ErrPasteExpired  = errors.New("paste expired")
-	validChars       [128]bool
 	version          = "devel"
 )
-
-func init() {
-	for _, r := range charset {
-		validChars[byte(r)] = true
-	}
-}
 
 //go:embed templates/index.html static/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
 var content embed.FS
@@ -54,14 +43,34 @@ type PasteContent struct {
 }
 
 type App struct {
-	DB              *sql.DB
-	Tmpl            *template.Template
-	IDLength        int
-	ExpDuration     time.Duration
-	CleanupInterval time.Duration
-	MaxSize         int64
-	writeMu         sync.Mutex
-	AssetVersion    string
+	DB           *sql.DB
+	Tmpl         *template.Template
+	Config       *Config
+	AssetVersion string
+	validChars   [128]bool
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		DBFile:          "pastes.db",
+		IDLength:        8,
+		ExpDuration:     30 * 24 * time.Hour,
+		CleanupInterval: time.Hour,
+		MaxSize:         1 << 20,
+		ListenAddr:      "0.0.0.0:8080",
+		LogLevel:        "info",
+		LogFormat:       "",
+		ReadTimeout:     5 * time.Second,
+		WriteTimeout:    10 * time.Second,
+		IdleTimeout:     120 * time.Second,
+		ShutdownTimeout: 15 * time.Second,
+		VacuumDelay:     30 * time.Second,
+		VacuumInterval:  24 * time.Hour,
+		BusyTimeout:     5000,
+		IndexCache:      "public, max-age=14400",
+		StaticCache:     "public, max-age=31536000, immutable",
+		Charset:         "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+	}
 }
 
 type Config struct {
@@ -73,6 +82,16 @@ type Config struct {
 	ListenAddr      string
 	LogLevel        string
 	LogFormat       string
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	IdleTimeout     time.Duration
+	ShutdownTimeout time.Duration
+	VacuumDelay     time.Duration
+	VacuumInterval  time.Duration
+	BusyTimeout     int
+	IndexCache      string
+	StaticCache     string
+	Charset         string
 }
 
 func NewApp(cfg *Config) (*App, error) {
@@ -84,7 +103,7 @@ func NewApp(cfg *Config) (*App, error) {
 	dbPath := cfg.DBFile
 	if dbPath == ":memory:" {
 		slog.Info("Using in-memory DB")
-		name := randString(32)
+		name := randString(32, cfg.Charset)
 		dbPath = fmt.Sprintf("file:%s?mode=memory&cache=shared", name)
 	} else {
 		slog.Info("Using file DB", "path", dbPath)
@@ -96,13 +115,16 @@ func NewApp(cfg *Config) (*App, error) {
 	}
 
 	app := &App{
-		DB:              db,
-		Tmpl:            tmpl,
-		IDLength:        cfg.IDLength,
-		ExpDuration:     cfg.ExpDuration,
-		CleanupInterval: cfg.CleanupInterval,
-		MaxSize:         cfg.MaxSize,
-		AssetVersion:    version,
+		DB:           db,
+		Tmpl:         tmpl,
+		Config:       cfg,
+		AssetVersion: version,
+	}
+
+	for _, r := range cfg.Charset {
+		if r < 128 {
+			app.validChars[byte(r)] = true
+		}
 	}
 
 	if err := app.initDB(); err != nil {
@@ -134,7 +156,7 @@ func (a *App) initDB() error {
 	if err != nil {
 		return err
 	}
-	_, err = a.DB.Exec("PRAGMA busy_timeout=5000")
+	_, err = a.DB.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", a.Config.BusyTimeout))
 	if err != nil {
 		return err
 	}
@@ -157,75 +179,57 @@ func (a *App) StartBackgroundTasks(ctx context.Context) {
 
 func (a *App) incrementalVacuumGoroutine(ctx context.Context) {
 	select {
-	case <-time.After(30 * time.Second):
-		a.runIncrementalVacuum()
+	case <-time.After(a.Config.VacuumDelay):
+		a.runIncrementalVacuum(ctx)
 	case <-ctx.Done():
 		return
 	}
 
-	ticker := time.NewTicker(24 * time.Hour)
+	ticker := time.NewTicker(a.Config.VacuumInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			a.runIncrementalVacuum()
+			a.runIncrementalVacuum(ctx)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (a *App) runIncrementalVacuum() {
-	_, err := a.DB.Exec("PRAGMA incremental_vacuum")
-	if err != nil {
+func (a *App) runIncrementalVacuum(ctx context.Context) {
+	if _, err := a.DB.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
 		slog.Error("Incremental vacuum failed", "err", err)
-		return
 	}
 	slog.Info("Incremental vacuum completed")
 }
 
-func (a *App) runCleanup() {
-	tx, err := a.DB.Begin()
-	if err != nil {
-		slog.Error("Cleanup tx begin error", "err", err)
-		return
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			slog.Error("Cleanup rollback error", "err", err)
-		}
-	}()
-
-	seconds := int(a.ExpDuration / time.Second)
+func (a *App) runCleanup(ctx context.Context) {
+	seconds := int(a.Config.ExpDuration.Seconds())
 	if seconds <= 0 {
-		slog.Warn("Expiration duration is zero or negative – skipping cleanup", "duration", a.ExpDuration)
 		return
 	}
 	modifier := fmt.Sprintf("-%d seconds", seconds)
-	res, err := tx.Exec("DELETE FROM pastes WHERE created < datetime('now', ?)", modifier)
+	res, err := a.DB.ExecContext(ctx, "DELETE FROM pastes WHERE created < datetime('now', ?)", modifier)
 	if err != nil {
-		slog.Error("Cleanup delete error", "err", err)
+		slog.Error("Database cleanup failed", "err", err)
 		return
 	}
-	rows, _ := res.RowsAffected()
-	if err := tx.Commit(); err != nil {
-		slog.Error("Cleanup commit error", "err", err)
-		return
-	}
-	if rows > 0 {
-		slog.Info("Cleaned up expired pastes", "deleted", rows)
+	count, _ := res.RowsAffected()
+	if count > 0 {
+		slog.Info("Expired pastes cleaned up", "count", count)
 	}
 }
 
 func (a *App) cleanupGoroutine(ctx context.Context) {
-	a.runCleanup()
+	a.runCleanup(ctx)
 
-	ticker := time.NewTicker(a.CleanupInterval)
+	ticker := time.NewTicker(a.Config.CleanupInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			a.runCleanup()
+			a.runCleanup(ctx)
 		case <-ctx.Done():
 			return
 		}
@@ -250,9 +254,9 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func cacheStatic(next http.Handler) http.Handler {
+func (a *App) cacheStatic(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("Cache-Control", a.Config.StaticCache)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -266,12 +270,12 @@ func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=14400")
+	w.Header().Set("Cache-Control", a.Config.IndexCache)
 
 	if r.Method == http.MethodHead {
 		return
@@ -311,7 +315,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Limit request size to paste MaxSize + approx base64/JSON overhead (3/2 factor)
-	r.Body = http.MaxBytesReader(w, r.Body, a.MaxSize*3/2+8192)
+	r.Body = http.MaxBytesReader(w, r.Body, a.Config.MaxSize*3/2+8192)
 
 	var req struct {
 		Data string `json:"data"`
@@ -329,7 +333,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if int64(len(req.Data)) > a.MaxSize*2 {
+	if int64(len(req.Data)) > a.Config.MaxSize*2 {
 		http.Error(w, "Payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -339,7 +343,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid data encoding", http.StatusBadRequest)
 		return
 	}
-	if int64(len(decodedData)) > a.MaxSize {
+	if int64(len(decodedData)) > a.Config.MaxSize {
 		http.Error(w, "Oversized data", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -350,7 +354,7 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := a.InsertPaste(decodedData, decodedIV)
+	id, err := a.InsertPaste(r.Context(), decodedData, decodedIV)
 	if err != nil {
 		slog.Error("Failed to insert paste", "err", err)
 		http.Error(w, "Server error", http.StatusInternalServerError)
@@ -361,32 +365,24 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, map[string]string{"id": id})
 }
 
-func (a *App) InsertPaste(data, iv []byte) (string, error) {
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-
-	length := a.IDLength
-	retries := 0
-
-	for {
-		id := randString(length)
-		res, err := a.DB.Exec("INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)", id, data, iv)
-		if err == nil {
-			rows, _ := res.RowsAffected()
-			if rows == 1 {
-				return id, nil
-			}
+func (a *App) InsertPaste(ctx context.Context, data, iv []byte) (string, error) {
+	for retries := range 10 {
+		length := a.Config.IDLength + retries
+		id := randString(length, a.Config.Charset)
+		res, err := a.DB.ExecContext(ctx, "INSERT OR IGNORE INTO pastes (id, data, iv) VALUES (?, ?, ?)", id, data, iv)
+		if err != nil {
+			return "", fmt.Errorf("insert error: %w", err)
 		}
-
-		retries++
-		if retries >= 100 {
-			return "", fmt.Errorf("insert failed after %d retries", retries)
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return "", fmt.Errorf("rows affected error: %w", err)
 		}
-		if retries%10 == 0 {
-			length++
-			slog.Info("id collision threshold reached", "new_length", length, "retries", retries)
+		if rows == 1 {
+			return id, nil
 		}
+		slog.Warn("id collision", "length", length, "retries", retries+1)
 	}
+	return "", fmt.Errorf("insert failed after 10 attempts")
 }
 
 func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
@@ -401,13 +397,13 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[2]
 	for _, ch := range id {
-		if ch >= 128 || !validChars[byte(ch)] {
+		if ch >= 128 || !a.validChars[byte(ch)] {
 			http.NotFound(w, r)
 			return
 		}
 	}
 
-	content, err := a.LoadPaste(id)
+	content, err := a.LoadPaste(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, ErrPasteNotFound) {
 			http.NotFound(w, r)
@@ -420,7 +416,7 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	secondsUntilExpiry := max(int(time.Until(content.Created.Add(a.ExpDuration)).Seconds()), 1)
+	secondsUntilExpiry := max(int(time.Until(content.Created.Add(a.Config.ExpDuration)).Seconds()), 1)
 
 	dataB64 := base64.StdEncoding.EncodeToString(content.Data)
 	ivB64 := base64.StdEncoding.EncodeToString(content.IV)
@@ -431,11 +427,11 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) LoadPaste(id string) (*PasteContent, error) {
+func (a *App) LoadPaste(ctx context.Context, id string) (*PasteContent, error) {
 	var dataBlob, ivBlob []byte
 	var created time.Time
 
-	err := a.DB.QueryRow("SELECT data, iv, created FROM pastes WHERE id = ?", id).
+	err := a.DB.QueryRowContext(ctx, "SELECT data, iv, created FROM pastes WHERE id = ?", id).
 		Scan(&dataBlob, &ivBlob, &created)
 	if err == sql.ErrNoRows {
 		return nil, ErrPasteNotFound
@@ -444,7 +440,7 @@ func (a *App) LoadPaste(id string) (*PasteContent, error) {
 		return nil, fmt.Errorf("db query error: %w", err)
 	}
 
-	if time.Until(created.Add(a.ExpDuration)) <= 0 {
+	if time.Until(created.Add(a.Config.ExpDuration)) <= 0 {
 		return nil, ErrPasteExpired
 	}
 
@@ -455,16 +451,18 @@ func (a *App) LoadPaste(id string) (*PasteContent, error) {
 	}, nil
 }
 
-func randString(length int) string {
+func randString(length int, charset string) string {
 	b := make([]byte, length)
 	_, _ = rand.Read(b)
+	cLen := len(charset)
+	maxAcc := 255 - (256 % cLen)
 	for i := range b {
 		rb := int(b[i])
-		for rb > maxAccept {
+		for rb > maxAcc {
 			_, _ = rand.Read(b[i : i+1])
 			rb = int(b[i])
 		}
-		b[i] = charset[rb%charsetLen]
+		b[i] = charset[rb%cLen]
 	}
 	return string(b)
 }
@@ -503,7 +501,7 @@ func newHandler(app *App) http.Handler {
 	mux := http.NewServeMux()
 
 	// Static files with long-term caching (immutable)
-	mux.Handle("/static/", cacheStatic(http.FileServer(http.FS(content))))
+	mux.Handle("/static/", app.cacheStatic(http.FileServer(http.FS(content))))
 
 	// Routes
 	mux.HandleFunc("/", app.serveIndex)
@@ -515,13 +513,7 @@ func newHandler(app *App) http.Handler {
 	return SecurityHeadersMiddleware(mux)
 }
 
-func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	cfg := parseFlags()
-	setupLogging(cfg)
-
+func run(ctx context.Context, cfg *Config) error {
 	app, err := NewApp(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize app: %w", err)
@@ -533,9 +525,9 @@ func run() error {
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      newHandler(app),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+		IdleTimeout:  cfg.IdleTimeout,
 		BaseContext:  func(_ net.Listener) context.Context { return ctx },
 	}
 
@@ -549,7 +541,7 @@ func run() error {
 	<-ctx.Done()
 	slog.Info("Shutting down gracefully...")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	return srv.Shutdown(shutdownCtx)
@@ -564,25 +556,27 @@ func parseFlags() *Config {
 	listenAddr := flag.String("addr", "0.0.0.0", "Listen address")
 	listenPort := flag.String("port", "8080", "Listen port")
 	logLevel := flag.String("log-level", "info", "Log level")
-	logFormat := flag.String("log-format", "", "Log format: text or json")
+	logFormat := flag.String("log-format", "", "Log format: text or json (default: text)")
 
 	flag.Parse()
 
-	return &Config{
-		DBFile:          *dbFile,
-		IDLength:        *idLength,
-		ExpDuration:     *expireDuration,
-		CleanupInterval: *cleanupInterval,
-		MaxSize:         *maxSize,
-		ListenAddr:      *listenAddr + ":" + *listenPort,
-		LogLevel:        *logLevel,
-		LogFormat:       *logFormat,
-	}
+	cfg := DefaultConfig()
+	cfg.DBFile = *dbFile
+	cfg.IDLength = *idLength
+	cfg.ExpDuration = *expireDuration
+	cfg.CleanupInterval = *cleanupInterval
+	cfg.MaxSize = *maxSize
+	cfg.ListenAddr = *listenAddr + ":" + *listenPort
+	cfg.LogLevel = *logLevel
+	cfg.LogFormat = *logFormat
+
+	return cfg
 }
 
 func setupLogging(cfg *Config) {
 	var level slog.Level
-	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+	err := level.UnmarshalText([]byte(cfg.LogLevel))
+	if err != nil {
 		level = slog.LevelInfo
 	}
 
@@ -599,10 +593,20 @@ func setupLogging(cfg *Config) {
 		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 	slog.SetDefault(slog.New(handler))
+
+	if err != nil {
+		slog.Warn("invalid log level, defaulting to info", "level", cfg.LogLevel, "err", err)
+	}
 }
 
 func main() {
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg := parseFlags()
+	setupLogging(cfg)
+
+	if err := run(ctx, cfg); err != nil {
 		slog.Error("Server failed", "err", err)
 		os.Exit(1)
 	}
