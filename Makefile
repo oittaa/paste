@@ -8,8 +8,8 @@ help: ## Display this help
 build: ## Build the binary
 	go build -o paste .
 
-test: ## Run unit tests
-	go test -v ./...
+test: ## Run unit tests with race detector
+	go test -v -race ./...
 
 lint: ## Run all linters (Go and JS)
 	golangci-lint run

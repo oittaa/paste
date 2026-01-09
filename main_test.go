@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
+	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,714 +18,462 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
+
+// testApp wraps the App and its test server
+type testApp struct {
+	*App
+	srv *httptest.Server
+}
+
+// newTestApp creates a new test instance with an in-memory database by default
+func newTestApp(t *testing.T, cfg *Config) *testApp {
+	t.Helper()
+	// Always favor :memory: for tests unless a specific file is requested
+	if cfg.DBFile == "pastes.db" || cfg.DBFile == "" {
+		cfg.DBFile = ":memory:"
+	}
+	app, err := NewApp(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create test app: %v", err)
+	}
+	srv := httptest.NewServer(newHandler(app))
+	ta := &testApp{App: app, srv: srv}
+	t.Cleanup(ta.Close)
+	return ta
+}
+
+func (ta *testApp) Close() {
+	ta.srv.Close()
+	ta.App.Close()
+}
+
+// do performs an HTTP request against the test server
+func (ta *testApp) do(t *testing.T, method, path string, body interface{}, headers map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	var bodyReader io.Reader
+	if body != nil {
+		switch v := body.(type) {
+		case string:
+			bodyReader = strings.NewReader(v)
+		default:
+			b, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("Failed to marshal body: %v", err)
+			}
+			bodyReader = bytes.NewReader(b)
+		}
+	}
+
+	req, err := http.NewRequest(method, ta.srv.URL+path, bodyReader)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	if body != nil && (headers == nil || headers["Content-Type"] == "") {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	res, err := ta.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	respBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
+	}
+	return res, respBody
+}
 
 func assertSecurityHeaders(t *testing.T, res *http.Response) {
 	t.Helper()
-
 	expectedCSP := "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';"
-	if got := res.Header.Get("Content-Security-Policy"); got != expectedCSP {
-		t.Errorf("CSP mismatch: expected %q, got %q", expectedCSP, got)
+	headers := map[string]string{
+		"Content-Security-Policy": expectedCSP,
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"Referrer-Policy":         "no-referrer",
 	}
-	if got := res.Header.Get("Permissions-Policy"); got != "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), fullscreen=(), picture-in-picture=()" {
-		t.Errorf("Permissions-Policy mismatch: got %q", got)
-	}
-	if got := res.Header.Get("X-Content-Type-Options"); got != "nosniff" {
-		t.Errorf("X-Content-Type-Options mismatch: got %q", got)
-	}
-	if got := res.Header.Get("X-Frame-Options"); got != "DENY" {
-		t.Errorf("X-Frame-Options mismatch: got %q", got)
-	}
-	if got := res.Header.Get("Referrer-Policy"); got != "no-referrer" {
-		t.Errorf("Referrer-Policy mismatch: got %q", got)
+	for k, v := range headers {
+		if got := res.Header.Get(k); got != v {
+			t.Errorf("Header %s mismatch: expected %q, got %q", k, v, got)
+		}
 	}
 }
 
 func TestMain(m *testing.M) {
-	// Completely silence all logging during tests
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
 }
 
-func TestAppIntegration(t *testing.T) {
-	// Create in-memory app for isolated testing
-	cfg := Config{
-		DBFile:          ":memory:",
-		IDLength:        8,
-		ExpDuration:     30 * 24 * time.Hour,
-		CleanupInterval: time.Hour,
-		MaxSize:         1 << 20,
-	}
-	app, err := NewApp(&cfg)
-	if err != nil {
-		t.Fatalf("Failed to create test app: %v", err)
-	}
-	defer app.Close()
-
-	handler := newHandler(app)
-	srv := httptest.NewServer(handler)
-	defer srv.Close()
-
-	t.Run("HealthHandler", func(t *testing.T) {
-		// GET
-		res, err := srv.Client().Get(srv.URL + "/health")
-		if err != nil {
-			t.Fatalf("Failed to GET /health: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200 for /health, got %d", res.StatusCode)
-		}
-		body, _ := io.ReadAll(res.Body)
-		if string(body) != "ok" {
-			t.Errorf("Expected body 'ok', got %s", string(body))
-		}
-		assertSecurityHeaders(t, res)
-
-		// HEAD (no body)
-		req, err := http.NewRequest("HEAD", srv.URL+"/health", nil)
-		if err != nil {
-			t.Fatalf("Failed to create HEAD request: %v", err)
-		}
-		res, err = srv.Client().Do(req)
-		if err != nil {
-			t.Fatalf("Failed to HEAD /health: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200 for HEAD /health, got %d", res.StatusCode)
-		}
-		body, _ = io.ReadAll(res.Body)
-		if len(body) != 0 {
-			t.Errorf("Expected empty body on HEAD, got %d bytes", len(body))
-		}
-		assertSecurityHeaders(t, res)
-
-		// Invalid method (POST)
-		req, err = http.NewRequest("POST", srv.URL+"/health", nil)
-		if err != nil {
-			t.Fatalf("Failed to create POST request: %v", err)
-		}
-		res, err = srv.Client().Do(req)
-		if err != nil {
-			t.Fatalf("Failed to POST /health: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for POST /health, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
-	})
-
-	t.Run("IndexHandler", func(t *testing.T) {
-		// GET
-		res, err := srv.Client().Get(srv.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to GET /: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200, got %d", res.StatusCode)
-		}
-		if res.Header.Get("Content-Type") != "text/html; charset=utf-8" {
-			t.Errorf("Expected Content-Type text/html; charset=utf-8, got %s", res.Header.Get("Content-Type"))
-		}
-		if got := res.Header.Get("Cache-Control"); got != "public, max-age=14400" {
-			t.Errorf("Expected Cache-Control public, max-age=14400 on index, got %q", got)
-		}
-		body, _ := io.ReadAll(res.Body)
-		if !strings.Contains(string(body), "<title>Paste</title>") {
-			t.Errorf("Expected HTML with title Paste")
-		}
-		assertSecurityHeaders(t, res)
-
-		// HEAD
-		req, err := http.NewRequest("HEAD", srv.URL+"/", nil)
-		if err != nil {
-			t.Fatalf("Failed to create HEAD request: %v", err)
-		}
-		res, err = srv.Client().Do(req)
-		if err != nil {
-			t.Fatalf("Failed to HEAD /: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected 200 for HEAD /, got %d", res.StatusCode)
-		}
-		body, _ = io.ReadAll(res.Body)
-		if len(body) != 0 {
-			t.Errorf("Expected empty body on HEAD /, got %d bytes", len(body))
-		}
-		if res.Header.Get("Cache-Control") != "public, max-age=14400" {
-			t.Errorf("Wrong Cache-Control on HEAD /")
-		}
-		assertSecurityHeaders(t, res)
-
-		// Invalid method (POST)
-		req, err = http.NewRequest("POST", srv.URL+"/", nil)
-		if err != nil {
-			t.Fatalf("Failed to create POST request: %v", err)
-		}
-		res, err = srv.Client().Do(req)
-		if err != nil {
-			t.Fatalf("Failed to POST /: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("Expected 405 for POST /, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
-
-		// 404 for invalid path
-		res, err = srv.Client().Get(srv.URL + "/invalid")
-		if err != nil {
-			t.Fatalf("Failed to GET /invalid: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected status 404 for invalid path, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
-	})
-
-	t.Run("StaticHandler", func(t *testing.T) {
-		for _, path := range []string{"/static/styles.css", "/static/script.js", "/static/favicon.jpg"} {
-			t.Run(path, func(t *testing.T) {
-				res, err := srv.Client().Get(srv.URL + path)
-				if err != nil {
-					t.Fatalf("Failed to GET %s: %v", path, err)
-				}
-				t.Cleanup(func() { _ = res.Body.Close() })
-				if res.StatusCode != http.StatusOK {
-					t.Errorf("Expected 200 for %s, got %d", path, res.StatusCode)
-				}
-				if got := res.Header.Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
-					t.Errorf("Expected long-term immutable Cache-Control on static, got %q", got)
-				}
-				assertSecurityHeaders(t, res)
-			})
-		}
-	})
-
-	t.Run("CreateHandler", func(t *testing.T) {
-		validIV := make([]byte, ivSize)
-		if _, err := rand.Read(validIV); err != nil {
-			t.Fatalf("Failed to generate valid IV: %v", err)
-		}
-		b64ValidIV := base64.StdEncoding.EncodeToString(validIV)
-
-		t.Run("ValidCreate", func(t *testing.T) {
-			fakeEncData := []byte("test paste content [fake encrypted]")
-			b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
-
-			reqBody, err := json.Marshal(map[string]string{
-				"data": b64Data,
-				"iv":   b64ValidIV,
-			})
-			if err != nil {
-				t.Fatalf("Failed to marshal request: %v", err)
-			}
-
-			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-			if err != nil {
-				t.Fatalf("Failed to POST /paste: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-
-			bodyBytes, _ := io.ReadAll(res.Body)
-			if res.StatusCode != http.StatusOK {
-				t.Errorf("Expected status 200, got %d: %s", res.StatusCode, string(bodyBytes))
-			}
-			assertSecurityHeaders(t, res)
-
-			var resp struct {
-				ID string `json:"id"`
-			}
-			if err := json.Unmarshal(bodyBytes, &resp); err != nil {
-				t.Fatalf("Failed to unmarshal response: %v", err)
-			}
-			if resp.ID == "" {
-				t.Error("Expected non-empty ID in response")
-			}
-			if len(resp.ID) != app.IDLength {
-				t.Errorf("Expected ID length %d, got %d", app.IDLength, len(resp.ID))
-			}
-		})
-
-		t.Run("InvalidJSON", func(t *testing.T) {
-			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader([]byte(`{invalid`)))
-			if err != nil {
-				t.Fatalf("Failed to POST invalid JSON: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusBadRequest {
-				t.Errorf("Expected 400 for invalid JSON, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("RequestTooLargePreDecode", func(t *testing.T) {
-			hugeBase64 := strings.Repeat("A", int(app.MaxSize*3/2+20000))
-			reqBody, _ := json.Marshal(map[string]string{
-				"data": hugeBase64,
-				"iv":   b64ValidIV,
-			})
-
-			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-			if err != nil {
-				t.Fatalf("Failed to POST huge request: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusRequestEntityTooLarge {
-				t.Errorf("Expected 413 Request too large (MaxBytesReader), got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("InvalidBase64Data", func(t *testing.T) {
-			reqBody, _ := json.Marshal(map[string]string{
-				"data": "!!!invalid-base64!!!",
-				"iv":   b64ValidIV,
-			})
-
-			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-			if err != nil {
-				t.Fatalf("Failed to POST invalid base64: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusBadRequest {
-				t.Errorf("Expected 400 for invalid base64 data, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("OversizedPostDecode", func(t *testing.T) {
-			oversized := make([]byte, int(app.MaxSize)+1)
-			b64Oversized := base64.StdEncoding.EncodeToString(oversized)
-			reqBody, _ := json.Marshal(map[string]string{
-				"data": b64Oversized,
-				"iv":   b64ValidIV,
-			})
-
-			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-			if err != nil {
-				t.Fatalf("Failed to POST oversized: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusRequestEntityTooLarge {
-				t.Errorf("Expected 413 for oversized decoded data, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("InvalidIVLength", func(t *testing.T) {
-			invalidIV := make([]byte, ivSize-1)
-			b64InvalidIV := base64.StdEncoding.EncodeToString(invalidIV)
-
-			smallData := []byte("small")
-			b64Data := base64.StdEncoding.EncodeToString(smallData)
-			reqBody, _ := json.Marshal(map[string]string{
-				"data": b64Data,
-				"iv":   b64InvalidIV,
-			})
-
-			res, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-			if err != nil {
-				t.Fatalf("Failed to POST invalid IV: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusBadRequest {
-				t.Errorf("Expected 400 for invalid IV length, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("NonPostMethod", func(t *testing.T) {
-			res, err := srv.Client().Get(srv.URL + "/paste")
-			if err != nil {
-				t.Fatalf("Failed to GET /paste: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusMethodNotAllowed {
-				t.Errorf("Expected 405 for non-POST, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-	})
-
-	t.Run("PasteHandler", func(t *testing.T) {
-		// Create a paste for retrieval tests
-		fakeEncData := []byte("retrievable paste [fake encrypted]")
-		b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
-		iv := make([]byte, ivSize)
-		if _, err := rand.Read(iv); err != nil {
-			t.Fatalf("Failed to generate IV: %v", err)
-		}
-		b64IV := base64.StdEncoding.EncodeToString(iv)
-
-		createReqBody, _ := json.Marshal(map[string]string{"data": b64Data, "iv": b64IV})
-		createRes, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(createReqBody))
-		if err != nil {
-			t.Fatalf("Failed to create paste for PasteHandler tests: %v", err)
-		}
-		t.Cleanup(func() { _ = createRes.Body.Close() })
-
-		if createRes.StatusCode != http.StatusOK {
-			t.Fatalf("Failed to create paste: expected 200, got %d", createRes.StatusCode)
-		}
-
-		createBody, _ := io.ReadAll(createRes.Body)
-		var createResp struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(createBody, &createResp); err != nil {
-			t.Fatalf("Failed to unmarshal create response: %v", err)
-		}
-		id := createResp.ID
-		if id == "" {
-			t.Fatal("Created paste has empty ID")
-		}
-
-		t.Run("GETVariousAccept", func(t *testing.T) {
-			for _, accept := range []string{"application/json", "", "text/html"} {
-				t.Run("Accept="+accept, func(t *testing.T) {
-					req, err := http.NewRequest("GET", srv.URL+"/p/"+id, nil)
-					if err != nil {
-						t.Fatalf("Failed to create request: %v", err)
-					}
-					if accept != "" {
-						req.Header.Set("Accept", accept)
-					}
-					res, err := srv.Client().Do(req)
-					if err != nil {
-						t.Fatalf("Failed to GET /p/%s: %v", id, err)
-					}
-					t.Cleanup(func() { _ = res.Body.Close() })
-
-					if res.StatusCode != http.StatusOK {
-						t.Errorf("Expected 200, got %d", res.StatusCode)
-					}
-					if res.Header.Get("Content-Type") != "application/json" {
-						t.Errorf("Expected application/json Content-Type, got %s", res.Header.Get("Content-Type"))
-					}
-					cache := res.Header.Get("Cache-Control")
-					if !strings.Contains(cache, "public") || !strings.Contains(cache, "immutable") || !strings.Contains(cache, "max-age=") {
-						t.Errorf("Expected public, immutable, max-age in Cache-Control, got %q", cache)
-					}
-					assertSecurityHeaders(t, res)
-
-					bodyBytes, _ := io.ReadAll(res.Body)
-					var getResp struct {
-						Data string `json:"data"`
-						IV   string `json:"iv"`
-					}
-					if err := json.Unmarshal(bodyBytes, &getResp); err != nil {
-						t.Errorf("Response not valid JSON: %v", err)
-					} else {
-						if getResp.Data != b64Data {
-							t.Errorf("Data mismatch")
-						}
-						if getResp.IV != b64IV {
-							t.Errorf("IV mismatch")
-						}
-					}
-				})
-			}
-		})
-
-		t.Run("HEAD", func(t *testing.T) {
-			req, err := http.NewRequest("HEAD", srv.URL+"/p/"+id, nil)
-			if err != nil {
-				t.Fatalf("Failed to create HEAD request: %v", err)
-			}
-			res, err := srv.Client().Do(req)
-			if err != nil {
-				t.Fatalf("Failed to HEAD /p/%s: %v", id, err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusOK {
-				t.Errorf("Expected 200 for HEAD, got %d", res.StatusCode)
-			}
-			if res.Header.Get("Content-Type") != "application/json" {
-				t.Errorf("Expected application/json on HEAD, got %s", res.Header.Get("Content-Type"))
-			}
-			cache := res.Header.Get("Cache-Control")
-			if !strings.Contains(cache, "public") || !strings.Contains(cache, "immutable") {
-				t.Errorf("Expected public, immutable in HEAD Cache-Control, got %q", cache)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("NonExistent", func(t *testing.T) {
-			res, err := srv.Client().Get(srv.URL + "/p/nonexistent")
-			if err != nil {
-				t.Fatalf("Failed to GET nonexistent: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusNotFound {
-				t.Errorf("Expected 404 for nonexistent, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("InvalidCharacters", func(t *testing.T) {
-			res, err := srv.Client().Get(srv.URL + "/p/abc!€$")
-			if err != nil {
-				t.Fatalf("Failed to GET invalid chars: %v", err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusNotFound {
-				t.Errorf("Expected 404 for invalid chars, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-
-		t.Run("InvalidPaths", func(t *testing.T) {
-			for _, path := range []string{"/p/", "/p", "/a/b/c"} {
-				res, err := srv.Client().Get(srv.URL + path)
-				if err != nil {
-					t.Fatalf("Failed to GET %s: %v", path, err)
-				}
-				t.Cleanup(func() { _ = res.Body.Close() })
-				if res.StatusCode != http.StatusNotFound {
-					t.Errorf("Expected 404 for %s, got %d", path, res.StatusCode)
-				}
-				assertSecurityHeaders(t, res)
-			}
-		})
-
-		t.Run("NonGetHeadMethod", func(t *testing.T) {
-			req, err := http.NewRequest("POST", srv.URL+"/p/"+id, nil)
-			if err != nil {
-				t.Fatalf("Failed to create POST request: %v", err)
-			}
-			res, err := srv.Client().Do(req)
-			if err != nil {
-				t.Fatalf("Failed to POST /p/%s: %v", id, err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-			if res.StatusCode != http.StatusMethodNotAllowed {
-				t.Errorf("Expected 405 for non-GET/HEAD, got %d", res.StatusCode)
-			}
-			assertSecurityHeaders(t, res)
-		})
-	})
-
-	t.Run("Expiration", func(t *testing.T) {
-		_, err := app.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', '-31 days'))`,
-			"expired", []byte("data"), make([]byte, ivSize))
-		if err != nil {
-			t.Fatalf("Failed to insert expired paste: %v", err)
-		}
-
-		res, err := srv.Client().Get(srv.URL + "/p/expired")
-		if err != nil {
-			t.Fatalf("Failed to GET expired: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusGone {
-			t.Errorf("Expected 410 Gone for expired paste, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
-
-		_, err = app.DB.Exec(`INSERT INTO pastes (id, data, iv) VALUES (?, ?, ?)`,
-			"fresh", []byte("data"), make([]byte, ivSize))
-		if err != nil {
-			t.Fatalf("Failed to insert fresh paste: %v", err)
-		}
-
-		res, err = srv.Client().Get(srv.URL + "/p/fresh")
-		if err != nil {
-			t.Fatalf("Failed to GET fresh: %v", err)
-		}
-		t.Cleanup(func() { _ = res.Body.Close() })
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("Expected 200 for fresh paste, got %d", res.StatusCode)
-		}
-		assertSecurityHeaders(t, res)
-	})
-
-	t.Run("BackgroundCleanup", func(t *testing.T) {
-		_, err := app.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', '-31 days'))`,
-			"tobecleaned", []byte("data"), make([]byte, ivSize))
-		if err != nil {
-			t.Fatalf("Insert failed: %v", err)
-		}
-
-		app.runCleanup()
-
-		var count int
-		err = app.DB.QueryRow("SELECT COUNT(*) FROM pastes WHERE id = ?", "tobecleaned").Scan(&count)
-		if err != nil || count != 0 {
-			t.Errorf("Expected paste to be cleaned up, still exists (count=%d, err=%v)", count, err)
-		}
-	})
-
-	t.Run("BackgroundVacuum", func(t *testing.T) {
-		app.runIncrementalVacuum()
-	})
-
-	t.Run("IDCollisionHandling", func(t *testing.T) {
-		cfg := Config{
-			DBFile:          ":memory:",
-			IDLength:        1,
-			ExpDuration:     30 * 24 * time.Hour,
-			CleanupInterval: time.Hour,
-			MaxSize:         1 << 20,
-		}
-		testApp, err := NewApp(&cfg)
-		if err != nil {
-			t.Fatalf("Failed to create collision test app: %v", err)
-		}
-		defer testApp.Close()
-
-		testHandler := newHandler(testApp)
-		testSrv := httptest.NewServer(testHandler)
-		defer testSrv.Close()
-
-		const numInserts = 200
-		var ids []string
-
-		dummyData := []byte("dummy")
-		dummyB64 := base64.StdEncoding.EncodeToString(dummyData)
-		dummyIV := make([]byte, ivSize)
-		_, _ = rand.Read(dummyIV)
-		dummyB64IV := base64.StdEncoding.EncodeToString(dummyIV)
-
-		reqBody, _ := json.Marshal(map[string]string{"data": dummyB64, "iv": dummyB64IV})
-
-		for i := range numInserts {
-			res, err := testSrv.Client().Post(testSrv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-			if err != nil {
-				t.Fatalf("POST %d failed: %v", i+1, err)
-			}
-			t.Cleanup(func() { _ = res.Body.Close() })
-
-			bodyBytes, _ := io.ReadAll(res.Body)
-			if res.StatusCode != http.StatusOK {
-				t.Fatalf("Insert %d expected 200, got %d: %s", i+1, res.StatusCode, string(bodyBytes))
-			}
-
-			var resp struct{ ID string }
-			if err := json.Unmarshal(bodyBytes, &resp); err != nil {
-				t.Fatalf("Unmarshal %d failed: %v", i+1, err)
-			}
-			if resp.ID == "" {
-				t.Fatalf("Empty ID on insert %d", i+1)
-			}
-			ids = append(ids, resp.ID)
-		}
-
-		if len(ids) != numInserts {
-			t.Errorf("Expected %d IDs, got %d", numInserts, len(ids))
-		}
-
-		var unique int
-		if err := testApp.DB.QueryRow("SELECT COUNT(DISTINCT id) FROM pastes").Scan(&unique); err != nil || unique != numInserts {
-			t.Errorf("Expected %d unique IDs, got %d (err: %v)", numInserts, unique, err)
-		}
-
-		var maxLen int
-		if err := testApp.DB.QueryRow("SELECT MAX(LENGTH(id)) FROM pastes").Scan(&maxLen); err != nil {
-			t.Fatalf("Max length query failed: %v", err)
-		}
-		if maxLen <= testApp.IDLength {
-			t.Errorf("Expected max ID length > %d after collisions, got %d", testApp.IDLength, maxLen)
+func TestNewAppErrors(t *testing.T) {
+	t.Run("InvalidDB", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.DBFile = "/nonexistent/path"
+		_, err := NewApp(cfg)
+		if err == nil {
+			t.Error("expected error for invalid DB path")
 		}
 	})
 }
 
-func TestConcurrentReadsInMemoryConsistency(t *testing.T) {
-	cfg := Config{
-		DBFile:          ":memory:",
-		IDLength:        8,
-		ExpDuration:     30 * 24 * time.Hour,
-		CleanupInterval: time.Hour,
-		MaxSize:         1 << 20,
-	}
-	app, err := NewApp(&cfg)
-	if err != nil {
-		t.Fatalf("Failed to create test app: %v", err)
-	}
-	defer app.Close()
+func TestAppIntegration(t *testing.T) {
+	ta := newTestApp(t, DefaultConfig())
 
-	handler := newHandler(app)
-	srv := httptest.NewServer(handler)
-	defer srv.Close()
+	t.Run("Endpoints", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			method   string
+			path     string
+			expected string // substring
+			status   int
+		}{
+			{"Health", "GET", "/health", "ok", 200},
+			{"Index", "GET", "/", "<title>Paste</title>", 200},
+			{"IndexHEAD", "HEAD", "/", "", 200},
+			{"IndexPOST", "POST", "/", "Method not allowed", 405},
+			{"IndexNotFound", "GET", "/any", "404 page not found", 404},
+			{"StaticCSS", "GET", "/static/styles.css", "body {", 200},
+			{"NotFound", "GET", "/p/invalid/too/many/parts", "404 page not found", 404},
+			{"PasteNotFound", "GET", "/p/none", "404 page not found", 404},
+			{"PasteInvalidChar", "GET", "/p/abc!", "404 page not found", 404},
+			{"PasteNonASCII", "GET", "/p/abc\x80", "404 page not found", 404},
+			{"MethodNotAllowed", "POST", "/health", "Method not allowed", 405},
+			{"PasteMethodNotAllowed", "POST", "/p/any", "Method not allowed", 405},
+			{"CreateMethodNotAllowed", "GET", "/paste", "Method not allowed", 405},
+		}
 
-	// Create one paste
-	validIV := make([]byte, ivSize)
-	if _, err := rand.Read(validIV); err != nil {
-		t.Fatalf("Failed to generate IV: %v", err)
-	}
-	b64IV := base64.StdEncoding.EncodeToString(validIV)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				res, body := ta.do(t, tt.method, tt.path, nil, nil)
+				if res.StatusCode != tt.status {
+					t.Errorf("expected %d, got %d", tt.status, res.StatusCode)
+				}
+				if !strings.Contains(string(body), tt.expected) {
+					t.Errorf("body doesn't contain %q", tt.expected)
+				}
+				assertSecurityHeaders(t, res)
 
-	fakeEncData := []byte("concurrent reads test paste content")
-	b64Data := base64.StdEncoding.EncodeToString(fakeEncData)
-
-	reqBody, err := json.Marshal(map[string]string{
-		"data": b64Data,
-		"iv":   b64IV,
+				if tt.method == "GET" && tt.status == 200 {
+					resHead, bodyHead := ta.do(t, "HEAD", tt.path, nil, nil)
+					if resHead.StatusCode != 200 {
+						t.Errorf("HEAD expected 200, got %d", resHead.StatusCode)
+					}
+					if len(bodyHead) != 0 {
+						t.Errorf("HEAD expected empty body, got %d bytes", len(bodyHead))
+					}
+				}
+			})
+		}
 	})
-	if err != nil {
-		t.Fatalf("Failed to marshal request: %v", err)
-	}
 
-	resp, err := srv.Client().Post(srv.URL+"/paste", "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		t.Fatalf("Failed to create paste: %v", err)
-	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("Expected 200 when creating paste, got %d: %s", resp.StatusCode, string(body))
-	}
+	t.Run("CreateAndRetrieve", func(t *testing.T) {
+		validIV := base64.StdEncoding.EncodeToString(make([]byte, ivSize))
+		validData := base64.StdEncoding.EncodeToString([]byte("test data"))
 
-	var createResp struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil || createResp.ID == "" {
-		t.Fatalf("Failed to parse created paste ID: %v", err)
-	}
-	pasteID := createResp.ID
+		res, body := ta.do(t, "POST", "/paste", map[string]string{"data": validData, "iv": validIV}, nil)
+		if res.StatusCode != 200 {
+			t.Fatalf("Create failed: %d %s", res.StatusCode, string(body))
+		}
+		var resp struct{ ID string }
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+		id := resp.ID
 
-	// Concurrent reads
-	const concurrency = 500 // High enough to force multiple pooled connections
+		res, body = ta.do(t, "GET", "/p/"+id, nil, nil)
+		if res.StatusCode != 200 {
+			t.Errorf("Retrieve failed: %d", res.StatusCode)
+		}
+		var getResp struct{ Data string }
+		if err := json.Unmarshal(body, &getResp); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+		if getResp.Data != validData {
+			t.Errorf("Data mismatch: expected %q, got %q", validData, getResp.Data)
+		}
+		assertSecurityHeaders(t, res)
+	})
+
+	t.Run("CreateErrors", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MaxSize = 10
+		smallApp := newTestApp(t, cfg)
+
+		cases := []struct {
+			name   string
+			body   interface{}
+			status int
+			msg    string
+		}{
+			{"InvalidJSON", "{invalid", 400, "Invalid JSON"},
+			{"PayloadTooLarge", map[string]string{"data": strings.Repeat("A", 100)}, 413, "Payload too large"},
+			{"OversizedData", map[string]string{"data": base64.StdEncoding.EncodeToString(make([]byte, 11))}, 413, "Oversized data"},
+			{"RequestTooLarge", map[string]string{"data": strings.Repeat("A", 10000)}, 413, "Request too large"},
+			{"InvalidBase64", map[string]string{"data": "!!!"}, 400, "Invalid data encoding"},
+			{"InvalidIV", map[string]string{"data": "YQ==", "iv": "YQ=="}, 400, "Invalid IV"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res, body := smallApp.do(t, "POST", "/paste", tc.body, nil)
+				if res.StatusCode != tc.status {
+					t.Errorf("expected %d, got %d", tc.status, res.StatusCode)
+				}
+				if !strings.Contains(string(body), tc.msg) {
+					t.Errorf("expected message %q, got %q", tc.msg, string(body))
+				}
+			})
+		}
+	})
+
+	t.Run("Expiration", func(t *testing.T) {
+		if _, err := ta.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', '-31 days'))`,
+			"expired", []byte("data"), make([]byte, ivSize)); err != nil {
+			t.Fatalf("Failed to insert expired paste: %v", err)
+		}
+
+		res, _ := ta.do(t, "GET", "/p/expired", nil, nil)
+		if res.StatusCode != http.StatusGone {
+			t.Errorf("expected 410, got %d", res.StatusCode)
+		}
+	})
+
+	t.Run("BackgroundTasks", func(t *testing.T) {
+		if _, err := ta.DB.Exec(`INSERT INTO pastes (id, data, iv, created) VALUES (?, ?, ?, datetime('now', '-31 days'))`,
+			"cleanup", []byte("data"), make([]byte, ivSize)); err != nil {
+			t.Fatalf("Failed to insert cleanup paste: %v", err)
+		}
+		ta.runCleanup(t.Context())
+		var count int
+		if err := ta.DB.QueryRow("SELECT COUNT(*) FROM pastes WHERE id = ?", "cleanup").Scan(&count); err != nil {
+			t.Fatalf("Failed to scan count: %v", err)
+		}
+		if count != 0 {
+			t.Error("expected paste to be cleaned up")
+		}
+		ta.runIncrementalVacuum(t.Context())
+
+		// Test vacuum with small table
+		if _, err := ta.DB.Exec("DELETE FROM pastes"); err != nil {
+			t.Fatalf("Failed to delete pastes: %v", err)
+		}
+		ta.runIncrementalVacuum(t.Context())
+	})
+
+	t.Run("IDCollision", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.IDLength = 1
+		collideApp := newTestApp(t, cfg)
+
+		req := map[string]string{"data": "YQ==", "iv": base64.StdEncoding.EncodeToString(make([]byte, ivSize))}
+		for i := range 100 {
+			res, _ := collideApp.do(t, "POST", "/paste", req, nil)
+			if res.StatusCode != 200 {
+				t.Fatalf("Collision insert failed at %d", i)
+			}
+		}
+		var maxLen int
+		if err := collideApp.DB.QueryRow("SELECT MAX(LENGTH(id)) FROM pastes").Scan(&maxLen); err != nil {
+			t.Fatalf("Failed to scan max length: %v", err)
+		}
+		if maxLen <= 1 {
+			t.Errorf("expected collision growth, got max length %d", maxLen)
+		}
+	})
+}
+
+func TestConcurrentReads(t *testing.T) {
+	ta := newTestApp(t, DefaultConfig())
+	validIV := base64.StdEncoding.EncodeToString(make([]byte, ivSize))
+	validData := base64.StdEncoding.EncodeToString([]byte("concurrent data"))
+
+	_, body := ta.do(t, "POST", "/paste", map[string]string{"data": validData, "iv": validIV}, nil)
+	var resp struct{ ID string }
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	id := resp.ID
+
+	const concurrency = 100
 	var wg sync.WaitGroup
 	var failed atomic.Int32
 
 	for range concurrency {
 		wg.Go(func() {
-
-			res, err := srv.Client().Get(srv.URL + "/p/" + pasteID)
-			if err != nil {
+			res, data := ta.do(t, "GET", "/p/"+id, nil, nil)
+			if res.StatusCode != 200 {
 				failed.Add(1)
 				return
 			}
-			defer func() { _ = res.Body.Close() }()
-			if res.StatusCode != http.StatusOK {
+			var getResp struct{ Data string }
+			if err := json.Unmarshal(data, &getResp); err != nil {
 				failed.Add(1)
 				return
 			}
-
-			var getResp struct {
-				Data string `json:"data"`
-				IV   string `json:"iv"`
-			}
-			if err := json.NewDecoder(res.Body).Decode(&getResp); err != nil {
-				failed.Add(1)
-				return
-			}
-
-			if getResp.Data != b64Data || getResp.IV != b64IV {
+			if getResp.Data != validData {
 				failed.Add(1)
 			}
 		})
 	}
+	wg.Wait()
+	if failed.Load() > 0 {
+		t.Errorf("Concurrent reads failed: %d/%d", failed.Load(), concurrency)
+	}
+}
 
+func TestConcurrentWrites(t *testing.T) {
+	ta := newTestApp(t, DefaultConfig())
+
+	const concurrency = 100
+	var wg sync.WaitGroup
+	var successful atomic.Int32
+
+	validIV := base64.StdEncoding.EncodeToString(make([]byte, ivSize))
+	validData := base64.StdEncoding.EncodeToString([]byte("concurrent write data"))
+
+	for range concurrency {
+		wg.Go(func() {
+			res, _ := ta.do(t, "POST", "/paste", map[string]string{"data": validData, "iv": validIV}, nil)
+			if res.StatusCode == 200 {
+				successful.Add(1)
+			}
+		})
+	}
 	wg.Wait()
 
-	if failed.Load() > 0 {
-		t.Errorf("Concurrent reads failed: %d/%d requests returned wrong/missing data (expected 0 failures with shared-cache)", failed.Load(), concurrency)
+	if successful.Load() != concurrency {
+		t.Errorf("Concurrent writes failed: only %d/%d succeeded", successful.Load(), concurrency)
+	}
+
+	var count int
+	if err := ta.DB.QueryRow("SELECT COUNT(*) FROM pastes").Scan(&count); err != nil {
+		t.Fatalf("Failed to count pastes: %v", err)
+	}
+	if count != int(concurrency) {
+		t.Errorf("Database count mismatch: expected %d, got %d", concurrency, count)
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	tests := []struct {
+		name     string
+		headers  map[string]string
+		remote   string
+		expected string
+	}{
+		{"CF", map[string]string{"CF-Connecting-IP": "1.1.1.1"}, "2.2.2.2:123", "1.1.1.1"},
+		{"XFF", map[string]string{"X-Forwarded-For": "3.3.3.3, 4.4.4.4"}, "2.2.2.2:123", "3.3.3.3"},
+		{"Remote", map[string]string{}, "5.5.5.5:123", "5.5.5.5"},
+		{"IPv6", map[string]string{}, "[2001:db8::1]:123", "2001:db8::1"},
+		{"Invalid", map[string]string{}, "invalid", "invalid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "/", nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			req.RemoteAddr = tt.remote
+			if got := clientIP(req); got != tt.expected {
+				t.Errorf("got %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseFlags(t *testing.T) {
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+
+	tmpFile, _ := os.CreateTemp("", "test.db")
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	os.Args = []string{"cmd", "-port", "9999", "-db", tmpPath}
+	cfg := parseFlags()
+	if cfg.ListenAddr != "0.0.0.0:9999" || cfg.DBFile != tmpPath {
+		t.Errorf("cfg mismatch: %+v", cfg)
+	}
+}
+
+func TestHandlersDatabaseDown(t *testing.T) {
+	ta := newTestApp(t, DefaultConfig())
+	if err := ta.DB.Close(); err != nil {
+		t.Fatalf("Failed to close DB: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		status int
+	}{
+		{"Health", "GET", "/health", 503},
+		{"Create", "POST", "/paste", 500},
+		{"Get", "GET", "/p/any", 500},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := map[string]string{"data": "YmFzZTY0", "iv": base64.StdEncoding.EncodeToString(make([]byte, ivSize))}
+			res, _ := ta.do(t, tt.method, tt.path, body, nil)
+			if res.StatusCode != tt.status {
+				t.Errorf("%s: expected %d, got %d", tt.name, tt.status, res.StatusCode)
+			}
+		})
+	}
+}
+
+func TestAppCloseRobustness(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open DB: %v", err)
+	}
+	app := &App{DB: db}
+	app.Close()
+	app.Close()
+}
+
+func TestSendHelpersError(t *testing.T) {
+	t.Run("sendJSONError", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		sendJSON(rr, map[string]interface{}{"f": func() {}})
+	})
+	t.Run("sendTextError", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		sendText(rr, "ok")
+		// Force write error
+		sendText(&failingWriter{}, "fail")
+	})
+}
+
+type failingWriter struct{ http.ResponseWriter }
+
+func (f *failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (f *failingWriter) Header() http.Header       { return http.Header{} }
+func (f *failingWriter) WriteHeader(int)           {}
+
+func TestSetupLogging(t *testing.T) {
+	setupLogging(&Config{LogLevel: "debug", LogFormat: "json"})
+	setupLogging(&Config{LogLevel: "warn", LogFormat: "text"})
+	setupLogging(&Config{LogLevel: "error", LogFormat: ""})
+	setupLogging(&Config{LogLevel: "invalid-level", LogFormat: "text"})
+}
+
+func TestRun(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DBFile = ":memory:"
+	cfg.ListenAddr = "127.0.0.1:0"
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := run(ctx, cfg); err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Errorf("run() failed: %v", err)
 	}
 }
