@@ -33,7 +33,7 @@ var (
 	version          = "devel"
 )
 
-//go:embed templates/index.html static/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css
+//go:embed templates/index.html static/index.html static/script.js static/styles.css static/favicon.jpg static/highlight.min.js static/atom-one-light.min.css static/atom-one-dark.min.css static/screenshot.png
 var content embed.FS
 
 type PasteContent struct {
@@ -92,6 +92,7 @@ type Config struct {
 	IndexCache      string
 	StaticCache     string
 	Charset         string
+	URL             string
 }
 
 func NewApp(cfg *Config) (*App, error) {
@@ -283,8 +284,12 @@ func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	type templateData struct {
 		AssetVersion string
+		URL          string
 	}
-	if err := a.Tmpl.Execute(w, templateData{AssetVersion: a.AssetVersion}); err != nil {
+	if err := a.Tmpl.Execute(w, templateData{
+		AssetVersion: a.AssetVersion,
+		URL:          a.Config.URL,
+	}); err != nil {
 		slog.Error("Template execute error", "err", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 	}
@@ -555,6 +560,7 @@ func parseFlags() *Config {
 	maxSize := flag.Int64("maxsize", 1<<20, "Maximum paste size in bytes (default 1MB)")
 	listenAddr := flag.String("addr", "0.0.0.0", "Listen address")
 	listenPort := flag.String("port", "8080", "Listen port")
+	url := flag.String("url", "", "Public URL (e.g. https://paste.example.com)")
 	logLevel := flag.String("log-level", "info", "Log level")
 	logFormat := flag.String("log-format", "", "Log format: text or json (default: text)")
 
@@ -567,6 +573,11 @@ func parseFlags() *Config {
 	cfg.CleanupInterval = *cleanupInterval
 	cfg.MaxSize = *maxSize
 	cfg.ListenAddr = *listenAddr + ":" + *listenPort
+
+	cfg.URL = *url
+	if cfg.URL == "" {
+		cfg.URL = os.Getenv("URL")
+	}
 	cfg.LogLevel = *logLevel
 	cfg.LogFormat = *logFormat
 
