@@ -19,7 +19,7 @@ export default defineConfig({
     { name: 'webkit', use: { ...devices['Desktop Safari'] } },
   ],
   webServer: {
-    command: 'go run main.go -addr 0.0.0.0 -port 8080 -db :memory:',
+    command: 'go run main.go -addr 127.0.0.1 -port 8080 -db :memory: -rate-limit 0 -max-pastes 0 -max-storage 0',
     url: 'http://localhost:8080/health',
     reuseExistingServer: !process.env.CI,
     stdout: 'ignore',

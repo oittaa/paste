@@ -10,9 +10,12 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,6 +122,94 @@ func TestNewAppErrors(t *testing.T) {
 		_, err := NewApp(cfg)
 		if err == nil {
 			t.Error("expected error for invalid DB path")
+		}
+	})
+	t.Run("InvalidConfig", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.IDLength = 0
+		_, err := NewApp(cfg)
+		if err == nil {
+			t.Error("expected error for invalid config")
+		}
+	})
+}
+
+func TestConfigValidate(t *testing.T) {
+	if err := DefaultConfig().Validate(); err != nil {
+		t.Fatalf("DefaultConfig is invalid: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"Nil", nil, "config is nil"},
+		{"EmptyDB", func(c *Config) { c.DBFile = "" }, "db path"},
+		{"IDLenZero", func(c *Config) { c.IDLength = 0 }, "id length"},
+		{"IDLenTooLong", func(c *Config) { c.IDLength = maxIDLength + 1 }, "id length"},
+		{"ExpireZero", func(c *Config) { c.ExpDuration = 0 }, "expire duration"},
+		{"CleanupZero", func(c *Config) { c.CleanupInterval = 0 }, "cleanup interval"},
+		{"MaxSizeZero", func(c *Config) { c.MaxSize = 0 }, "max size"},
+		{"MaxSizeOverflow", func(c *Config) { c.MaxSize = math.MaxInt64 }, "max size"},
+		{"ReadTimeoutZero", func(c *Config) { c.ReadTimeout = 0 }, "timeouts"},
+		{"ShutdownTimeoutZero", func(c *Config) { c.ShutdownTimeout = 0 }, "shutdown timeout"},
+		{"VacuumDelayNeg", func(c *Config) { c.VacuumDelay = -1 }, "vacuum delay"},
+		{"VacuumIntervalZero", func(c *Config) { c.VacuumInterval = 0 }, "vacuum interval"},
+		{"BusyTimeoutNeg", func(c *Config) { c.BusyTimeout = -1 }, "busy timeout"},
+		{"RateLimitNeg", func(c *Config) { c.RateLimit = -1 }, "rate limit"},
+		{"RateWindowNeg", func(c *Config) { c.RateWindow = -1 }, "rate window"},
+		{"RateWindowZeroWithLimit", func(c *Config) { c.RateLimit = 10; c.RateWindow = 0 }, "rate window"},
+		{"MaxPastesNeg", func(c *Config) { c.MaxPastes = -1 }, "max pastes"},
+		{"MaxStorageNeg", func(c *Config) { c.MaxStorage = -1 }, "max storage"},
+		{"CharsetEmpty", func(c *Config) { c.Charset = "" }, "charset"},
+		{"CharsetOneChar", func(c *Config) { c.Charset = "A" }, "charset"},
+		{"CharsetSlash", func(c *Config) { c.Charset = "AB/" }, "charset"},
+		{"CharsetColon", func(c *Config) { c.Charset = "AB:" }, "charset"},
+		{"ListenBad", func(c *Config) { c.ListenAddr = "not-an-addr" }, "listen address"},
+		{"ListenPortBad", func(c *Config) { c.ListenAddr = "127.0.0.1:99999" }, "listen port"},
+		{"URLBad", func(c *Config) { c.URL = "javascript:alert(1)" }, "url"},
+		{"LogLevelBad", func(c *Config) { c.LogLevel = "nope" }, "log level"},
+		{"LogFormatBad", func(c *Config) { c.LogFormat = "xml" }, "log format"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			if tc.mut == nil {
+				err = (*Config)(nil).Validate()
+			} else {
+				cfg := DefaultConfig()
+				tc.mut(cfg)
+				err = cfg.Validate()
+			}
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("IDLenMaxOK", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.IDLength = maxIDLength
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ListenPortZeroOK", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.ListenAddr = "127.0.0.1:0"
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("HTTPSURLOK", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.URL = "https://paste.example.com"
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
@@ -362,16 +453,19 @@ func TestConcurrentWrites(t *testing.T) {
 
 func TestClientIP(t *testing.T) {
 	tests := []struct {
-		name     string
-		headers  map[string]string
-		remote   string
-		expected string
+		name       string
+		headers    map[string]string
+		remote     string
+		trustProxy bool
+		expected   string
 	}{
-		{"CF", map[string]string{"CF-Connecting-IP": "1.1.1.1"}, "2.2.2.2:123", "1.1.1.1"},
-		{"XFF", map[string]string{"X-Forwarded-For": "3.3.3.3, 4.4.4.4"}, "2.2.2.2:123", "3.3.3.3"},
-		{"Remote", map[string]string{}, "5.5.5.5:123", "5.5.5.5"},
-		{"IPv6", map[string]string{}, "[2001:db8::1]:123", "2001:db8::1"},
-		{"Invalid", map[string]string{}, "invalid", "invalid"},
+		{"CFTrusted", map[string]string{"CF-Connecting-IP": "1.1.1.1"}, "2.2.2.2:123", true, "1.1.1.1"},
+		{"XFFTrusted", map[string]string{"X-Forwarded-For": "3.3.3.3, 4.4.4.4"}, "2.2.2.2:123", true, "3.3.3.3"},
+		{"CFUntrusted", map[string]string{"CF-Connecting-IP": "1.1.1.1"}, "2.2.2.2:123", false, "2.2.2.2"},
+		{"XFFUntrusted", map[string]string{"X-Forwarded-For": "3.3.3.3, 4.4.4.4"}, "2.2.2.2:123", false, "2.2.2.2"},
+		{"Remote", map[string]string{}, "5.5.5.5:123", false, "5.5.5.5"},
+		{"IPv6", map[string]string{}, "[2001:db8::1]:123", false, "2001:db8::1"},
+		{"Invalid", map[string]string{}, "invalid", false, "invalid"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -380,7 +474,7 @@ func TestClientIP(t *testing.T) {
 				req.Header.Set(k, v)
 			}
 			req.RemoteAddr = tt.remote
-			if got := clientIP(req); got != tt.expected {
+			if got := clientIP(req, tt.trustProxy); got != tt.expected {
 				t.Errorf("got %q, want %q", got, tt.expected)
 			}
 		})
@@ -401,6 +495,9 @@ func TestParseFlags(t *testing.T) {
 	cfg := parseFlags()
 	if cfg.ListenAddr != "0.0.0.0:9999" || cfg.DBFile != tmpPath {
 		t.Errorf("cfg mismatch: %+v", cfg)
+	}
+	if cfg.RateLimit != 60 || cfg.MaxPastes != 100000 || cfg.MaxStorage != 1<<30 || cfg.TrustProxy {
+		t.Errorf("production limit defaults mismatch: %+v", cfg)
 	}
 }
 
@@ -475,5 +572,133 @@ func TestRun(t *testing.T) {
 	defer cancel()
 	if err := run(ctx, cfg); err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		t.Errorf("run() failed: %v", err)
+	}
+}
+
+func TestRunListenError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	cfg := DefaultConfig()
+	cfg.DBFile = ":memory:"
+	cfg.ListenAddr = ln.Addr().String()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := run(ctx, cfg); err == nil {
+		t.Fatal("expected listen error")
+	}
+}
+
+func validPasteBody() map[string]string {
+	return map[string]string{
+		"data": base64.StdEncoding.EncodeToString([]byte("test data")),
+		"iv":   base64.StdEncoding.EncodeToString(make([]byte, ivSize)),
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RateLimit = 2
+	cfg.RateWindow = time.Minute
+	ta := newTestApp(t, cfg)
+
+	for i := range 2 {
+		res, body := ta.do(t, "POST", "/paste", validPasteBody(), nil)
+		if res.StatusCode != 200 {
+			t.Fatalf("create %d: expected 200, got %d %s", i, res.StatusCode, body)
+		}
+	}
+	res, body := ta.do(t, "POST", "/paste", validPasteBody(), nil)
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d %s", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "Rate limit exceeded") {
+		t.Errorf("unexpected body %q", body)
+	}
+	if res.Header.Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+}
+
+func TestStorageCapMaxPastes(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxPastes = 1
+	ta := newTestApp(t, cfg)
+
+	res, body := ta.do(t, "POST", "/paste", validPasteBody(), nil)
+	if res.StatusCode != 200 {
+		t.Fatalf("first create: expected 200, got %d %s", res.StatusCode, body)
+	}
+	res, body = ta.do(t, "POST", "/paste", validPasteBody(), nil)
+	if res.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("expected 507, got %d %s", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "Storage full") {
+		t.Errorf("unexpected body %q", body)
+	}
+}
+
+func TestStorageCapMaxBytes(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxStorage = 5
+	ta := newTestApp(t, cfg)
+
+	res, body := ta.do(t, "POST", "/paste", validPasteBody(), nil)
+	if res.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("expected 507, got %d %s", res.StatusCode, body)
+	}
+}
+
+func TestAutoVacuumIncremental(t *testing.T) {
+	ta := newTestApp(t, DefaultConfig())
+	var mode int
+	if err := ta.DB.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA auto_vacuum: %v", err)
+	}
+	if mode != autoVacuumIncremental {
+		t.Fatalf("auto_vacuum=%d, want %d (incremental)", mode, autoVacuumIncremental)
+	}
+}
+
+func TestAutoVacuumMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE pastes (
+		id TEXT PRIMARY KEY,
+		data BLOB NOT NULL,
+		iv BLOB NOT NULL,
+		created DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	var mode int
+	if err := db.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA auto_vacuum: %v", err)
+	}
+	if mode == autoVacuumIncremental {
+		t.Fatal("legacy db already uses incremental auto_vacuum")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DBFile = path
+	app, err := NewApp(cfg)
+	if err != nil {
+		t.Fatalf("NewApp: %v", err)
+	}
+	t.Cleanup(app.Close)
+	if err := app.DB.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA auto_vacuum after migrate: %v", err)
+	}
+	if mode != autoVacuumIncremental {
+		t.Fatalf("auto_vacuum=%d, want %d after migration", mode, autoVacuumIncremental)
 	}
 }

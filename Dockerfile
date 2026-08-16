@@ -17,7 +17,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-w -s -X main.version=
 
 FROM alpine:3.23
 
-RUN apk add --no-cache curl
+RUN apk add --no-cache curl su-exec \
+    && adduser -D -u 65532 paste \
+    && mkdir -p /app/db /home/paste/.cloudflared \
+    && chown -R paste:paste /app/db /home/paste
 
 # Add cloudflared if needed (as per user example)
 COPY --from=cloudflare/cloudflared:2025.11.1 /usr/local/bin/cloudflared /usr/local/bin/cloudflared
@@ -32,9 +35,6 @@ COPY --from=builder /app/paste /app/paste
 COPY static /app/static
 COPY templates /app/templates
 
-# Setup database directory
-RUN mkdir -p /app/db
-
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -47,4 +47,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 # Default tunnel name (can be overridden at runtime)
 ENV TUNNEL_NAME=""
 
+# Entrypoint starts as root so it can chown the DB volume, then drops to uid 65532.
 ENTRYPOINT ["/entrypoint.sh"]
