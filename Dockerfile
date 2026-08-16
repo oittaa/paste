@@ -1,3 +1,5 @@
+FROM cloudflare/cloudflared:2026.8.2 AS cloudflared
+
 FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
@@ -22,8 +24,7 @@ RUN apk add --no-cache curl su-exec \
     && mkdir -p /app/db /home/paste/.cloudflared \
     && chown -R paste:paste /app/db /home/paste
 
-# Add cloudflared if needed (as per user example)
-COPY --from=cloudflare/cloudflared:2025.11.1 /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 
 WORKDIR /app
 
