@@ -14,16 +14,8 @@ TRUST_PROXY=0
 
 if [ -n "$TUNNEL_NAME" ]; then
     if [ -f "$CF_DIR/config.yml" ]; then
+        echo "Starting Cloudflared tunnel..."
         cloudflared tunnel --config "$CF_DIR/config.yml" run "$TUNNEL_NAME" &
-
-        echo "Waiting for Cloudflared tunnel to connect..."
-        for i in $(seq 1 30); do
-            if cloudflared tunnel info "$TUNNEL_NAME" > /dev/null 2>&1; then
-                echo "Tunnel connected!"
-                break
-            fi
-            sleep 2
-        done
         TRUST_PROXY=1
     else
         echo "Cloudflare tunnel configuration not found at $CF_DIR/config.yml, skipping tunnel setup."
