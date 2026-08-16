@@ -9,6 +9,8 @@ const statusElem = document.getElementById('status');
 
 const ivLength = 12;
 const tagLength = 128;
+const maxPlaintextBytes = 1024 * 1024;
+const maxDecompressBytes = 2 * 1024 * 1024;
 let isViewMode = false;
 let currentSequence = 0;
 
@@ -66,7 +68,31 @@ async function compress(data) {
 
 async function decompress(compressed) {
     const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            total += value.byteLength;
+            if (total > maxDecompressBytes) {
+                throw new Error('Decompressed paste too large');
+            }
+            chunks.push(value);
+        }
+    } finally {
+        await reader.cancel().catch(() => { });
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return out;
 }
 
 async function encrypt(text, key) {
@@ -109,7 +135,7 @@ async function createPaste() {
         showStatus('Secure context required (HTTPS/localhost)', 'error');
         return;
     }
-    if (new Blob([text]).size > 1024 * 1024) {
+    if (new Blob([text]).size > maxPlaintextBytes) {
         showStatus('Plain text > 1MB', 'error');
         return;
     }
@@ -224,7 +250,11 @@ async function loadPaste() {
         output.value = plain;
         return true;
     } catch (e) {
-        showStatus('Decryption failed. Wrong or invalid key.', 'error');
+        if (e instanceof Error && e.message === 'Decompressed paste too large') {
+            showStatus('Paste is too large to open.', 'error');
+        } else {
+            showStatus('Decryption failed. Wrong or invalid key.', 'error');
+        }
         console.error('Decryption error:', e);
         return false;
     }

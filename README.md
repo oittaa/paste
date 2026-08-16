@@ -38,8 +38,15 @@ The application will be available at `http://localhost:8080`.
 | `-db` | `pastes.db` | SQLite DB file (use `:memory:` for in-mem) |
 | `-maxsize` | `1048576` | Maximum paste size in bytes |
 | `-expire-duration` | `720h` | Paste expiration duration |
+| `-rate-limit` | `60` | Max paste creates per IP per window (`0` disables) |
+| `-rate-window` | `1m` | Rate limit window |
+| `-max-pastes` | `100000` | Maximum stored pastes (`0` disables) |
+| `-max-storage` | `1073741824` | Maximum total paste bytes (`0` disables) |
+| `-trust-proxy` | `false` | Trust `CF-Connecting-IP` and `X-Forwarded-For` |
 
 Run `./paste -help` for the full list of options.
+
+Set `-trust-proxy` when the process is behind Cloudflare or another reverse proxy. Without that flag, rate limits use the TCP peer address.
 
 ## Deployment with Docker
 
@@ -63,7 +70,7 @@ docker build -t paste .
 docker run -d -p 8080:8080 -v $(pwd)/data:/app/db paste
 # With Tunnel
 docker run -d --name paste -e TUNNEL_NAME=my-paste-tunnel \
-  -v "$HOME/.cloudflared":/root/.cloudflared:ro -v "$HOME/paste-db":/app/db paste
+  -v "$HOME/.cloudflared":/home/paste/.cloudflared:ro -v "$HOME/paste-db":/app/db paste
 ```
 
 > **Note**: Cloudflare tunnel is optional. If `TUNNEL_NAME` is not set, the app starts normally.

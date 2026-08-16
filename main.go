@@ -12,11 +12,15 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,12 +28,19 @@ import (
 )
 
 const (
-	ivSize = 12 // AES-GCM IV size in bytes
+	ivSize                = 12 // AES-GCM IV size in bytes
+	maxPasteIDLen         = 256
+	insertIDRetries       = 10
+	requestSizePad        = 8192
+	charsetUnsafe         = `/\:?#%`
+	maxIDLength           = maxPasteIDLen - insertIDRetries + 1
+	autoVacuumIncremental = 2
 )
 
 var (
 	ErrPasteNotFound = errors.New("paste not found")
 	ErrPasteExpired  = errors.New("paste expired")
+	ErrStorageFull   = errors.New("storage full")
 	version          = "devel"
 )
 
@@ -47,7 +58,68 @@ type App struct {
 	Tmpl         *template.Template
 	Config       *Config
 	AssetVersion string
+	limiter      *ipRateLimiter
 	validChars   [128]bool
+}
+
+// ipRateLimiter is a sliding-window limiter keyed by client IP.
+type ipRateLimiter struct {
+	mu     sync.Mutex
+	hits   map[string][]time.Time
+	limit  int
+	window time.Duration
+}
+
+func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
+	return &ipRateLimiter{
+		hits:   make(map[string][]time.Time),
+		limit:  limit,
+		window: window,
+	}
+}
+
+func (rl *ipRateLimiter) allow(key string) bool {
+	if rl == nil || rl.limit <= 0 || rl.window <= 0 {
+		return true
+	}
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	times := rl.hits[key]
+	kept := times[:0]
+	for _, t := range times {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= rl.limit {
+		rl.hits[key] = kept
+		return false
+	}
+	rl.hits[key] = append(kept, now)
+	if len(rl.hits) > 4096 {
+		rl.pruneLocked(cutoff)
+	}
+	return true
+}
+
+func (rl *ipRateLimiter) pruneLocked(cutoff time.Time) {
+	for k, times := range rl.hits {
+		kept := times[:0]
+		for _, t := range times {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(rl.hits, k)
+		} else {
+			rl.hits[k] = kept
+		}
+	}
 }
 
 func DefaultConfig() *Config {
@@ -70,6 +142,11 @@ func DefaultConfig() *Config {
 		IndexCache:      "public, max-age=14400",
 		StaticCache:     "public, max-age=31536000, immutable",
 		Charset:         "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+		RateLimit:       0,
+		RateWindow:      time.Minute,
+		MaxPastes:       0,
+		MaxStorage:      0,
+		TrustProxy:      false,
 	}
 }
 
@@ -93,9 +170,141 @@ type Config struct {
 	StaticCache     string
 	Charset         string
 	URL             string
+	RateLimit       int
+	RateWindow      time.Duration
+	MaxPastes       int64
+	MaxStorage      int64
+	TrustProxy      bool
+}
+
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("config is nil")
+	}
+
+	var errs []error
+
+	if c.DBFile == "" {
+		errs = append(errs, fmt.Errorf("db path must not be empty"))
+	}
+	if c.IDLength < 1 || c.IDLength > maxIDLength {
+		errs = append(errs, fmt.Errorf("id length must be between 1 and %d", maxIDLength))
+	}
+	if c.ExpDuration <= 0 {
+		errs = append(errs, fmt.Errorf("expire duration must be greater than 0"))
+	}
+	if c.CleanupInterval <= 0 {
+		errs = append(errs, fmt.Errorf("cleanup interval must be greater than 0"))
+	}
+	if c.MaxSize <= 0 {
+		errs = append(errs, fmt.Errorf("max size must be greater than 0"))
+	} else if c.MaxSize > (math.MaxInt64-requestSizePad)/3 {
+		errs = append(errs, fmt.Errorf("max size is too large"))
+	}
+	if c.ReadTimeout <= 0 || c.WriteTimeout <= 0 || c.IdleTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("read, write, and idle timeouts must be greater than 0"))
+	}
+	if c.ShutdownTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("shutdown timeout must be greater than 0"))
+	}
+	if c.VacuumDelay < 0 {
+		errs = append(errs, fmt.Errorf("vacuum delay must not be negative"))
+	}
+	if c.VacuumInterval <= 0 {
+		errs = append(errs, fmt.Errorf("vacuum interval must be greater than 0"))
+	}
+	if c.BusyTimeout < 0 {
+		errs = append(errs, fmt.Errorf("busy timeout must not be negative"))
+	}
+	if c.RateLimit < 0 {
+		errs = append(errs, fmt.Errorf("rate limit must not be negative"))
+	}
+	if c.RateWindow < 0 {
+		errs = append(errs, fmt.Errorf("rate window must not be negative"))
+	}
+	if c.RateLimit > 0 && c.RateWindow <= 0 {
+		errs = append(errs, fmt.Errorf("rate window must be greater than 0 when rate limit is set"))
+	}
+	if c.MaxPastes < 0 {
+		errs = append(errs, fmt.Errorf("max pastes must not be negative"))
+	}
+	if c.MaxStorage < 0 {
+		errs = append(errs, fmt.Errorf("max storage must not be negative"))
+	}
+	if err := validateCharset(c.Charset); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateListenAddr(c.ListenAddr); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validatePublicURL(c.URL); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateLogSettings(c.LogLevel, c.LogFormat); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateCharset(charset string) error {
+	if charset == "" {
+		return fmt.Errorf("charset must not be empty")
+	}
+	seen := make(map[rune]struct{}, len(charset))
+	for _, r := range charset {
+		if r < 33 || r > 126 || strings.ContainsRune(charsetUnsafe, r) {
+			return fmt.Errorf("charset contains invalid character %q", r)
+		}
+		seen[r] = struct{}{}
+	}
+	if len(seen) < 2 {
+		return fmt.Errorf("charset must contain at least 2 distinct characters")
+	}
+	return nil
+}
+
+func validateListenAddr(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("listen address %q is invalid", addr)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("listen port %q is invalid", port)
+	}
+	return nil
+}
+
+func validatePublicURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("url must be an absolute http(s) URL")
+	}
+	return nil
+}
+
+func validateLogSettings(level, format string) error {
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		return fmt.Errorf("log level %q is invalid", level)
+	}
+	switch strings.ToLower(format) {
+	case "", "text", "json":
+		return nil
+	default:
+		return fmt.Errorf("log format %q is invalid", format)
+	}
 }
 
 func NewApp(cfg *Config) (*App, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	tmpl, err := template.ParseFS(content, "templates/index.html")
 	if err != nil {
 		return nil, err
@@ -120,6 +329,7 @@ func NewApp(cfg *Config) (*App, error) {
 		Tmpl:         tmpl,
 		Config:       cfg,
 		AssetVersion: version,
+		limiter:      newIPRateLimiter(cfg.RateLimit, cfg.RateWindow),
 	}
 
 	for _, r := range cfg.Charset {
@@ -136,7 +346,22 @@ func NewApp(cfg *Config) (*App, error) {
 }
 
 func (a *App) initDB() error {
-	_, err := a.DB.Exec(`CREATE TABLE IF NOT EXISTS pastes (
+	_, err := a.DB.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", a.Config.BusyTimeout))
+	if err != nil {
+		return err
+	}
+	if err := a.enableIncrementalVacuum(); err != nil {
+		slog.Warn("Failed to enable incremental auto_vacuum", "err", err)
+	}
+	_, err = a.DB.Exec("PRAGMA journal_mode=WAL")
+	if err != nil {
+		return err
+	}
+	_, err = a.DB.Exec("PRAGMA synchronous=NORMAL")
+	if err != nil {
+		return err
+	}
+	_, err = a.DB.Exec(`CREATE TABLE IF NOT EXISTS pastes (
 		id TEXT PRIMARY KEY,
 		data BLOB NOT NULL,
 		iv BLOB NOT NULL,
@@ -149,27 +374,30 @@ func (a *App) initDB() error {
 	if err != nil {
 		slog.Warn("Failed to create index", "err", err)
 	}
-	_, err = a.DB.Exec("PRAGMA journal_mode=WAL")
-	if err != nil {
-		return err
-	}
-	_, err = a.DB.Exec("PRAGMA synchronous=NORMAL")
-	if err != nil {
-		return err
-	}
-	_, err = a.DB.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", a.Config.BusyTimeout))
-	if err != nil {
-		return err
-	}
-	_, err = a.DB.Exec("PRAGMA auto_vacuum = INCREMENTAL")
-	if err != nil {
-		slog.Warn("Failed to enable incremental auto_vacuum", "err", err)
-	}
 	var count int64
 	if err := a.DB.QueryRow("SELECT COUNT(*) FROM pastes").Scan(&count); err != nil {
 		return fmt.Errorf("database initialization failed: unable to verify paste count: %w", err)
 	}
 	slog.Info("database ready", "paste_count", count)
+	return nil
+}
+
+// enableIncrementalVacuum sets PRAGMA auto_vacuum=INCREMENTAL.
+// SQLite applies that mode only before the first table exists, or after VACUUM.
+func (a *App) enableIncrementalVacuum() error {
+	var mode int
+	if err := a.DB.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		return err
+	}
+	if mode == autoVacuumIncremental {
+		return nil
+	}
+	if _, err := a.DB.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
+		return err
+	}
+	if _, err := a.DB.Exec("VACUUM"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -201,6 +429,7 @@ func (a *App) incrementalVacuumGoroutine(ctx context.Context) {
 func (a *App) runIncrementalVacuum(ctx context.Context) {
 	if _, err := a.DB.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
 		slog.Error("Incremental vacuum failed", "err", err)
+		return
 	}
 	slog.Info("Incremental vacuum completed")
 }
@@ -319,6 +548,13 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := clientIP(r, a.Config.TrustProxy)
+	if !a.limiter.allow(ip) {
+		w.Header().Set("Retry-After", strconv.Itoa(max(int(a.Config.RateWindow.Seconds()), 1)))
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	// Limit request size to paste MaxSize + approx base64/JSON overhead (3/2 factor)
 	r.Body = http.MaxBytesReader(w, r.Body, a.Config.MaxSize*3/2+8192)
 
@@ -329,10 +565,10 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			slog.Warn("create request too large", "remote_addr", clientIP(r))
+			slog.Warn("create request too large", "remote_addr", ip)
 			http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
 		} else {
-			slog.Warn("invalid create request", "err", err, "remote_addr", clientIP(r))
+			slog.Warn("invalid create request", "err", err, "remote_addr", ip)
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		}
 		return
@@ -359,19 +595,51 @@ func (a *App) serveCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := a.ensureStorage(r.Context(), len(decodedData)); err != nil {
+		if errors.Is(err, ErrStorageFull) {
+			http.Error(w, "Storage full", http.StatusInsufficientStorage)
+			return
+		}
+		slog.Error("Failed to check storage", "err", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
 	id, err := a.InsertPaste(r.Context(), decodedData, decodedIV)
 	if err != nil {
 		slog.Error("Failed to insert paste", "err", err)
 		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
-	slog.Info("paste created", "id", id, "size_bytes", len(decodedData), "remote_addr", clientIP(r))
+	slog.Info("paste created", "size_bytes", len(decodedData))
 
 	sendJSON(w, map[string]string{"id": id})
 }
 
+func (a *App) ensureStorage(ctx context.Context, newBytes int) error {
+	if a.Config.MaxPastes > 0 {
+		var count int64
+		if err := a.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM pastes").Scan(&count); err != nil {
+			return fmt.Errorf("count pastes: %w", err)
+		}
+		if count >= a.Config.MaxPastes {
+			return ErrStorageFull
+		}
+	}
+	if a.Config.MaxStorage > 0 {
+		var used int64
+		if err := a.DB.QueryRowContext(ctx, "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM pastes").Scan(&used); err != nil {
+			return fmt.Errorf("sum paste bytes: %w", err)
+		}
+		if used+int64(newBytes) > a.Config.MaxStorage {
+			return ErrStorageFull
+		}
+	}
+	return nil
+}
+
 func (a *App) InsertPaste(ctx context.Context, data, iv []byte) (string, error) {
-	for retries := range 10 {
+	for retries := range insertIDRetries {
 		length := a.Config.IDLength + retries
 		id := randString(length, a.Config.Charset)
 		res, err := a.DB.ExecContext(ctx, "INSERT OR IGNORE INTO pastes (id, data, iv) VALUES (?, ?, ?)", id, data, iv)
@@ -387,7 +655,7 @@ func (a *App) InsertPaste(ctx context.Context, data, iv []byte) (string, error) 
 		}
 		slog.Warn("id collision", "length", length, "retries", retries+1)
 	}
-	return "", fmt.Errorf("insert failed after 10 attempts")
+	return "", fmt.Errorf("insert failed after %d attempts", insertIDRetries)
 }
 
 func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
@@ -396,7 +664,7 @@ func (a *App) servePaste(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 || parts[1] != "p" || parts[2] == "" || len(parts[2]) > 256 {
+	if len(parts) != 3 || parts[1] != "p" || parts[2] == "" || len(parts[2]) > maxPasteIDLen {
 		http.NotFound(w, r)
 		return
 	}
@@ -472,14 +740,16 @@ func randString(length int, charset string) string {
 	return string(b)
 }
 
-func clientIP(r *http.Request) string {
-	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
-		return ip
-	}
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.Split(fwd, ",")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+			return ip
+		}
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			parts := strings.Split(fwd, ",")
+			if len(parts) > 0 {
+				return strings.TrimSpace(parts[0])
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -536,20 +806,23 @@ func run(ctx context.Context, cfg *Config) error {
 		BaseContext:  func(_ net.Listener) context.Context { return ctx },
 	}
 
+	serverErr := make(chan error, 1)
 	go func() {
 		slog.Info("Starting server", "version", version, "addr", cfg.ListenAddr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("ListenAndServe failed", "err", err)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
 		}
 	}()
 
-	<-ctx.Done()
-	slog.Info("Shutting down gracefully...")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer cancel()
-
-	return srv.Shutdown(shutdownCtx)
+	select {
+	case err := <-serverErr:
+		return fmt.Errorf("listen failed: %w", err)
+	case <-ctx.Done():
+		slog.Info("Shutting down gracefully...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	}
 }
 
 func parseFlags() *Config {
@@ -563,6 +836,11 @@ func parseFlags() *Config {
 	url := flag.String("url", "", "Public URL (e.g. https://paste.example.com)")
 	logLevel := flag.String("log-level", "info", "Log level")
 	logFormat := flag.String("log-format", "", "Log format: text or json (default: text)")
+	rateLimit := flag.Int("rate-limit", 60, "Max paste creates per IP per rate window (0 disables)")
+	rateWindow := flag.Duration("rate-window", time.Minute, "Rate limit window")
+	maxPastes := flag.Int64("max-pastes", 100000, "Maximum stored pastes (0 disables)")
+	maxStorage := flag.Int64("max-storage", 1<<30, "Maximum total paste bytes (0 disables)")
+	trustProxy := flag.Bool("trust-proxy", false, "Trust CF-Connecting-IP and X-Forwarded-For")
 
 	flag.Parse()
 
@@ -580,6 +858,11 @@ func parseFlags() *Config {
 	}
 	cfg.LogLevel = *logLevel
 	cfg.LogFormat = *logFormat
+	cfg.RateLimit = *rateLimit
+	cfg.RateWindow = *rateWindow
+	cfg.MaxPastes = *maxPastes
+	cfg.MaxStorage = *maxStorage
+	cfg.TrustProxy = *trustProxy
 
 	return cfg
 }
@@ -615,6 +898,10 @@ func main() {
 	defer stop()
 
 	cfg := parseFlags()
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid config: %v\n", err)
+		os.Exit(1)
+	}
 	setupLogging(cfg)
 
 	if err := run(ctx, cfg); err != nil {

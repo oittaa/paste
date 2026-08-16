@@ -6,7 +6,7 @@ services:
     volumes:
       - ./data:/app/db
       # Uncomment the line below to enable Cloudflare tunnel support
-      # - ~/.cloudflared:/root/.cloudflared:ro
+      # - ~/.cloudflared:/home/paste/.cloudflared:ro
     # Uncomment and set TUNNEL_NAME to enable Cloudflare tunnel (requires config at ~/.cloudflared/config.yml)
     # environment:
     #   - TUNNEL_NAME=my-paste-tunnel
