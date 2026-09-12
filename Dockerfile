@@ -1,4 +1,4 @@
-FROM cloudflare/cloudflared:2026.8.2 AS cloudflared
+FROM cloudflare/cloudflared:2026.9.1 AS cloudflared
 
 FROM golang:1.26-alpine AS builder
 
