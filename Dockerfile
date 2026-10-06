@@ -17,7 +17,7 @@ COPY . .
 # We use go build ./... or just . since main is in the root
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-w -s -X main.version=$(git rev-parse --short HEAD 2>/dev/null || date +%s)" -o paste .
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 RUN apk add --no-cache curl su-exec \
     && adduser -D -u 65532 paste \
